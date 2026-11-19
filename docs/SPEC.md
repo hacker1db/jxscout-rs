@@ -6,12 +6,13 @@ non-code material about the original [jxscout](https://github.com/francisconeves
 
 | Tag | Source |
 | --- | --- |
-| `[README]` | Upstream `README.md` (feature list, CLI flags, prompt command list, troubleshooting) |
-| `[TREE]` | Upstream `docs/tree.md` (AST analysis tree / descriptor categories) |
-| `[REL-0.3]`, `[REL-0.4]`, `[REL-0.5]`, `[REL-0.9.2]` | Upstream GitHub release notes for those versions |
-| `[#N]` | Text of upstream GitHub issue N and its comments |
+| `[README]` | Upstream [`README.md` @ 3a1018a](https://github.com/francisconeves97/jxscout/blob/3a1018a694fd630137b1c19525abcb47315404d4/README.md) (feature list, CLI flags, prompt command list, troubleshooting) |
+| `[TREE]` | Upstream [`docs/tree.md` @ 3a1018a](https://github.com/francisconeves97/jxscout/blob/3a1018a694fd630137b1c19525abcb47315404d4/docs/tree.md) (AST analysis tree / descriptor categories) |
+| `[REL-0.3]`, `[REL-0.4]`, `[REL-0.5]`, `[REL-0.9.2]` | Release notes: [v0.3.0](https://github.com/francisconeves97/jxscout/releases/tag/v0.3.0), [v0.4.0](https://github.com/francisconeves97/jxscout/releases/tag/v0.4.0), [v0.5.0](https://github.com/francisconeves97/jxscout/releases/tag/v0.5.0), [v0.9.2](https://github.com/francisconeves97/jxscout/releases/tag/v0.9.2) |
+| `[#N]` | Text of upstream issue `https://github.com/francisconeves97/jxscout/issues/N` and its comments. Links to source code inside issue comments (e.g. in #20) were **not** followed. |
 
-No upstream source files (`.go`, `.js`, `.ts`, or vendored code) were opened
+No upstream source files (`.go`, `.js`, `.ts`, or vendored code) and no
+code snippets embedded in issues were opened or used
 while writing this spec or the implementation. Where the upstream docs are
 silent, this spec makes its own design decisions; those are marked **(design)**.
 
@@ -50,8 +51,12 @@ R-11. **(design)** Ingest payload: `POST /ingest` with a JSON body
 `headers` values may be a string or an array of strings. Exactly one of `body`
 or `body_base64` may be set; both absent means "no body" (the tool may fetch the
 URL itself). `GET /health` returns `200 ok`. A batch form (`POST /ingest/batch`,
-JSON array) is accepted. `[#20]` asked for a documented "reference request or
-DTO".
+JSON array, at most 1000 entries) is accepted. Request bodies are capped
+(default 64 MiB). `[#20]` asked for a documented "reference request or DTO".
+
+R-11a. **(design, security)** If `--ingest-token` (env `JXSCOUT_INGEST_TOKEN`)
+is set, every ingest request must carry `Authorization: Bearer <token>`, else
+`401`. Binding to a non-loopback address requires `--allow-remote-ingest`.
 
 R-12. Non-Burp / non-Caido users must have standalone ingest paths `[#20]`:
 - R-12a. `curl` against the endpoint (documented with an example).
@@ -84,6 +89,10 @@ R-23. **(design)** Patterns without `/` are matched against the URL host;
 patterns containing `/` are matched against the full URL (without fragment).
 Matching is case-insensitive.
 
+R-22a. Explicit exclusions always win, including over the referral (R-25) and
+same-origin (R-56) exceptions. A scope consisting only of `!` patterns means
+"everything except the exclusions". **(design)**
+
 R-24. When a request is out of scope, a debug-level log line must include the
 URL (and host) of the rejected request and which rule rejected it. `[#9]`
 
@@ -107,8 +116,11 @@ component collides with an existing file, an alternate directory name is used.
 `[#19]`
 
 R-33. Path mapping must be immune to traversal: `..`, absolute paths, NUL,
-drive letters, and reserved characters from URLs or source-map `sources` must
-never escape the project directory. **(design, security)**
+drive letters, percent-encoded separators (decoded **before** validation), and
+reserved characters from URLs or source-map `sources` must never escape the
+project directory. The project name is validated as a single safe path
+component. Writes refuse to follow symlinks inside the output tree. Collision
+handling is deterministic (same inputs → same path). **(design, security)**
 
 R-34. Reversed source-map sources are written under
 `<project>/<host>/(sourcemaps)/…`, prefixed by host to avoid clashes between
@@ -119,8 +131,12 @@ don't re-download the same files; relationships "HTML page loads JS" and "JS
 loaded by pages" are recorded. `[REL-0.5]`, `[README]` (`loads`, `loaded`,
 `assets`, `truncate-tables`).
 
-R-36. Downloads have a max size (default 20 MiB) and a timeout; oversized
-responses are aborted and logged. **(design, security)**
+R-36. Downloads have a max size (default 20 MiB), enforced on the streamed,
+**decompressed** body regardless of `Content-Length`, plus a total per-request
+timeout; oversized responses are aborted and logged. Discovery work is bounded:
+max recursion depth (default 3), max chunk URLs per script (default
+bruteforce limit + 1000), max source-map sources written per map (default
+10 000). **(design, security)**
 
 ## 5. Processing pipeline
 
@@ -154,8 +170,10 @@ set can be found, brute-force numeric ids `0..limit` (default 3000).
 
 R-53. **(design)** Vite / ESM: collect the string sources of `import()`
 expressions, static `import`/`export … from` declarations, and string arrays of
-`.js` paths passed to preload helpers; resolve relative to the script URL (for
-`./`, `../`) or to the origin root otherwise.
+`.js` paths passed to preload helpers. Resolution: absolute `http(s)://` URLs
+as-is; `/x` against the origin; `./x` and `../x` against the script URL;
+preload-array entries like `assets/x.js` against the origin root (Vite base).
+Bare package specifiers (`react`, `@scope/pkg`) are skipped.
 
 R-54. Discovered chunks are processed like any other JS (recursively), with URL
 de-duplication and a depth limit. `[README]`
@@ -165,9 +183,18 @@ unlimited) and concurrency-limited (default 5). `[README]` (`-fetch-concurrency`
 `-rate-limiter-max-requests-per-second`, `-rate-limiter-max-requests-per-minute`),
 `[REL-0.4]`
 
-R-56. Chunk and source-map fetches only target `http`/`https` URLs, and only
-hosts that are in scope, the same host as the parent asset, or (with
-`--download-referred-js`) anything referenced. **(design, SSRF guard)**
+R-56. **(design, SSRF guard)** One outbound policy applies to *every*
+tool-initiated fetch (URL lists, missing-body ingests, chunks, source maps,
+referred JS) and to every redirect hop:
+- scheme must be `http` or `https`;
+- the target must be in scope, or the same origin as the parent asset, or
+  (with `--download-referred-js`, for scripts only) referenced from an in-scope
+  page — exclusions (R-22a) always win;
+- the resolved IP addresses must not be loopback, private, link-local, CGNAT,
+  unspecified, multicast, or IPv4-mapped forms of those, unless
+  `--allow-private-targets` is set. The check runs in the DNS resolver so the
+  connection uses the validated address (no TOCTOU via DNS rebinding);
+- at most 5 redirects.
 
 ## 7. Authenticated fetching
 
@@ -176,18 +203,21 @@ request, it forwards that request's authentication headers (default `Cookie`,
 `Authorization`; configurable list) so assets behind auth are downloaded
 correctly instead of a login redirect. `[#31]`
 
-R-61. **(design, security)** Forwarding is limited by `--forward-auth`
-`same-host` (default), `in-scope`, or `never`; headers are never forwarded to
-other hosts by default, and never across an `https`→`http` downgrade.
+R-61. **(design, security)** Forwarding is limited by `--forward-auth`:
+`same-origin` (default; scheme + host + port must equal the captured request's),
+`in-scope` (any in-scope origin, still no `https`→`http` downgrade), or `never`.
+On redirects to a different origin, forwarded credentials are dropped.
 
 R-62. **(design)** Extra static headers can be supplied with `--header 'K: V'`
-(repeatable) for every tool-initiated fetch.
+(repeatable); they are sent only to in-scope origins and follow the same
+redirect rule.
 
 ## 8. Source maps
 
 R-70. Reverse application source code when source maps are available. `[README]`
 
-R-71. Discovery order, first hit wins `[#13]`:
+R-71. Candidates are tried in this order and the **first candidate that
+validates** (R-73) wins; an invalid candidate falls through to the next `[#13]`:
 1. `SourceMap` response header, then `X-SourceMap`.
 2. The last `//# sourceMappingURL=` (or legacy `//@`) comment in the file.
 3. Inline `data:` URIs (base64 or percent-encoded JSON).
@@ -196,8 +226,9 @@ R-71. Discovery order, first hit wins `[#13]`:
 R-72. Transient fetch failures (connect errors, 429, 5xx) are retried with
 backoff (default 2 retries). `[#13]`
 
-R-73. A response is only accepted as a source map if it parses as one; HTML login
-pages or 404 bodies are rejected. `[#13]`, `[#31]`
+R-73. A response is only accepted as a source map if the status is 2xx **and**
+the body parses as a source map; HTML login pages and 404 bodies (even ones that
+contain map-like JSON) are rejected. `[#13]`, `[#31]`
 
 R-74. Each `sources[i]` that has `sourcesContent[i]` is written to disk
 (R-34); sources without content are listed in the log. `[README]`
