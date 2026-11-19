@@ -359,29 +359,19 @@ impl Fetcher {
         );
         // Reserve memory before reading a single body byte. The task calling
         // us holds no other reservation, so waiting here can't deadlock.
-        let mut memory = match &self.inner.budget {
-            Some(b) => {
-                let announced = resp.content_length().unwrap_or(limit).min(limit);
-                Some(b.reserve(announced as usize).await)
-            }
+        let initial = match resp.content_length() {
+            Some(n) => n.min(limit) as usize,
+            None => UNKNOWN_LENGTH_START.min(limit as usize),
+        };
+        let memory = match &self.inner.budget {
+            Some(b) => Some(b.reserve(initial).await),
             None => None,
         };
-        let mut body = Vec::new();
+        let mut body = BodyBuf::new(initial, limit, memory);
         while let Some(chunk) = resp.chunk().await? {
-            let new_len = body.len() + chunk.len();
-            if new_len as u64 > limit {
-                return Err(FetchError::TooLarge { limit });
-            }
-            if let Some(m) = memory.as_mut()
-                && !m.try_grow(new_len)
-            {
-                return Err(FetchError::OverBudget);
-            }
-            body.extend_from_slice(&chunk);
+            body.push(&chunk)?;
         }
-        if let Some(m) = memory.as_mut() {
-            m.shrink_to(body.len());
-        }
+        let (body, memory) = body.finish();
         Ok(FetchResponse {
             url,
             status,
@@ -390,6 +380,69 @@ impl Fetcher {
             stayed_on_origin: true,
             memory,
         })
+    }
+}
+
+/// Initial buffer (and reservation) when the server sends no Content-Length.
+const UNKNOWN_LENGTH_START: usize = 64 * 1024;
+
+/// A response body being streamed in, whose memory reservation always
+/// covers the buffer's *capacity* (not just its length): `Vec` grows by
+/// doubling, so charging only `len()` could under-count by up to 2×.
+struct BodyBuf {
+    buf: Vec<u8>,
+    limit: u64,
+    memory: Option<Reservation>,
+}
+
+impl BodyBuf {
+    fn new(initial: usize, limit: u64, memory: Option<Reservation>) -> Self {
+        Self {
+            buf: Vec::with_capacity(initial),
+            limit,
+            memory,
+        }
+    }
+
+    /// Append a chunk, growing the reservation *before* the buffer grows.
+    fn push(&mut self, chunk: &[u8]) -> Result<(), FetchError> {
+        let new_len = self.buf.len() + chunk.len();
+        if new_len as u64 > self.limit {
+            return Err(FetchError::TooLarge { limit: self.limit });
+        }
+        if new_len > self.buf.capacity() {
+            // Grow geometrically (amortized O(1) appends) but never past
+            // the download cap, and charge the new capacity first.
+            let target = new_len.max((self.buf.capacity() * 2).min(self.limit as usize));
+            self.charge(target)?;
+            self.buf.reserve_exact(target - self.buf.len());
+            // `reserve_exact` may round up; cover whatever we really got.
+            self.charge(self.buf.capacity())?;
+        }
+        self.buf.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), FetchError> {
+        match self.memory.as_mut() {
+            Some(m) => {
+                if m.try_grow(bytes) {
+                    Ok(())
+                } else {
+                    Err(FetchError::OverBudget)
+                }
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Trim the buffer and give back the unused reservation.
+    fn finish(mut self) -> (Vec<u8>, Option<Reservation>) {
+        self.buf.shrink_to_fit();
+        if let Some(m) = self.memory.as_mut() {
+            m.shrink_to(self.buf.capacity());
+        }
+        (self.buf, self.memory)
     }
 }
 
@@ -427,6 +480,38 @@ mod tests {
             origin: u(origin).origin(),
             headers: h,
         }
+    }
+
+    /// Security review (5th pass): the reservation covers the buffer's
+    /// capacity at every step, not just its length.
+    #[tokio::test]
+    async fn body_buffer_reservation_covers_capacity() {
+        let budget = crate::budget::Budget::new(1024 * 1024);
+        let res = budget.reserve(100).await;
+        let mut b = BodyBuf::new(100, 600 * 1024, Some(res));
+        for i in 0..200 {
+            b.push(&vec![b'x'; 1000 + i * 7]).unwrap();
+            let reserved = b.memory.as_ref().unwrap().bytes();
+            assert!(
+                reserved >= b.buf.capacity(),
+                "step {i}: {reserved} < {}",
+                b.buf.capacity()
+            );
+        }
+        let len = b.buf.len();
+        let (body, mem) = b.finish();
+        assert_eq!(body.len(), len);
+        assert!(mem.as_ref().unwrap().bytes() >= body.capacity());
+        assert!(budget.peak() <= budget.capacity());
+        // Over the cap → TooLarge; over the budget → OverBudget.
+        let mut small = BodyBuf::new(0, 10, None);
+        assert!(matches!(
+            small.push(&[0; 11]),
+            Err(FetchError::TooLarge { .. })
+        ));
+        let tiny = crate::budget::Budget::new(2048);
+        let mut over = BodyBuf::new(1024, 1 << 20, Some(tiny.reserve(1024).await));
+        assert!(matches!(over.push(&[0; 4096]), Err(FetchError::OverBudget)));
     }
 
     #[test]

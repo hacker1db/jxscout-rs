@@ -114,3 +114,9 @@ One design replaces the earlier patches: `src/budget.rs` (`Budget` + RAII `Reser
 | --- | --- | --- | --- |
 | 1 | Med | Fetched bodies charged only after being buffered | Fixed: `Fetcher::with_budget` reserves after response headers and before reading the body (announced length or `max_body_bytes`), `try_grow`s per chunk (hard cutoff, `OverBudget` error), and `shrink_to`s the real size; the reservation travels in `FetchResponse::memory` and lives as long as the body |
 | 2 | Med | Source-map jobs spawned without admission; inline map bytes uncharged | Fixed: one `Pipeline::admit(Work)` path for items, chunks, remote map lookups, and inline maps (slot + reservation). Refused work that already holds bytes is skipped with a debug log; work that will fetch waits inside the fetcher while holding nothing (deadlock rule in `budget.rs` docs). Tests: `budget::tests` (grow/shrink/release, waiters, oversize) and `fetched_bodies_respect_the_memory_budget` (8 concurrent 600 KiB downloads + remote maps + inline maps under a 1 MiB budget: peak ≤ budget, `in_use() == 0` at the end, run 5× without flakes). New `CHALLENGES.md` #9 explains the RAII design |
+
+## Security review, 5th pass (security-guidance plugin, on `731d842`)
+
+| # | Sev | Finding | Action |
+| --- | --- | --- | --- |
+| 1 | Med | Streaming charged `body.len()`, but `Vec` doubling can allocate ~2× | Fixed: `BodyBuf` starts at the reserved size (announced length, or 64 KiB when unknown), grows the reservation to the new capacity *before* `reserve_exact`, re-charges whatever capacity it actually got, and at the end `shrink_to_fit()` then `shrink_to(capacity)`. Test `body_buffer_reservation_covers_capacity` asserts reserved ≥ capacity at every step |
