@@ -20,6 +20,14 @@ fn target_path(t: &AssignmentTarget<'_>) -> Option<String> {
             let object = member_path(&m.object).unwrap_or_else(|| "(expr)".into());
             Some(format!("{object}.{}", m.property.name))
         }
+        // `el["innerHTML"] = …`
+        AssignmentTarget::ComputedMemberExpression(m) => match &m.expression {
+            Expression::StringLiteral(s) => {
+                let object = member_path(&m.object).unwrap_or_else(|| "(expr)".into());
+                Some(format!("{object}.{}", s.value.display()))
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -156,6 +164,53 @@ impl DomStateRule {
     }
 }
 
+impl DomStateRule {
+    /// Classify a `object.prop` access (static or literal-computed).
+    fn member(cx: &mut RuleContext<'_>, span: oxc_span::Span, object: &Expression<'_>, prop: &str) {
+        let Some(object) = member_path(object) else {
+            return;
+        };
+        let full = format!("{object}.{prop}");
+        let rw = Self::rw(cx, span);
+        let obj_last = last_segment(&object);
+        let m_span = span;
+        if full.ends_with("document.domain") {
+            cx.report(
+                m_span,
+                format!("Client Behavior/document.domain/{rw}"),
+                full,
+            );
+        } else if full == "window.name" || full == "self.name" {
+            cx.report(m_span, format!("Client Behavior/window.name/{rw}"), full);
+        } else if full.ends_with("document.cookie") {
+            cx.report(m_span, format!("Client Behavior/Storage/Cookie/{rw}"), full);
+        } else if obj_last == "location"
+            && matches!(
+                object.as_str(),
+                "location"
+                    | "window.location"
+                    | "document.location"
+                    | "self.location"
+                    | "top.location"
+            )
+        {
+            cx.report(
+                m_span,
+                format!("Client Behavior/Location/{rw}/{prop}"),
+                full,
+            );
+        } else if matches!(obj_last, "localStorage" | "sessionStorage")
+            && !matches!(prop, "getItem" | "setItem" | "removeItem")
+        {
+            cx.report(
+                m_span,
+                format!("Client Behavior/Storage/{obj_last}/{prop}"),
+                full,
+            );
+        }
+    }
+}
+
 impl Rule for DomStateRule {
     fn id(&self) -> &'static str {
         "dom-state"
@@ -166,49 +221,16 @@ impl Rule for DomStateRule {
     fn check(&self, node: AstKind<'_>, cx: &mut RuleContext<'_>) {
         match node {
             AstKind::StaticMemberExpression(m) => {
-                let Some(object) = member_path(&m.object) else {
-                    return;
-                };
-                let prop = m.property.name.as_str();
-                let full = format!("{object}.{prop}");
-                let rw = Self::rw(cx, m.span);
-                let obj_last = last_segment(&object);
-
-                if full.ends_with("document.domain") {
-                    cx.report(
-                        m.span,
-                        format!("Client Behavior/document.domain/{rw}"),
-                        full,
-                    );
-                } else if full == "window.name" || full == "self.name" {
-                    cx.report(m.span, format!("Client Behavior/window.name/{rw}"), full);
-                } else if full.ends_with("document.cookie") {
-                    cx.report(m.span, format!("Client Behavior/Storage/Cookie/{rw}"), full);
-                } else if obj_last == "location"
-                    && matches!(
-                        object.as_str(),
-                        "location"
-                            | "window.location"
-                            | "document.location"
-                            | "self.location"
-                            | "top.location"
-                    )
-                {
-                    cx.report(
-                        m.span,
-                        format!("Client Behavior/Location/{rw}/{prop}"),
-                        full,
-                    );
-                } else if matches!(obj_last, "localStorage" | "sessionStorage")
-                    && !matches!(prop, "getItem" | "setItem" | "removeItem")
-                {
-                    cx.report(
-                        m.span,
-                        format!("Client Behavior/Storage/{obj_last}/{prop}"),
-                        full,
-                    );
+                Self::member(cx, m.span, &m.object, m.property.name.as_str());
+            }
+            // `document["cookie"]`, `window["name"]`
+            AstKind::ComputedMemberExpression(m) => {
+                if let Expression::StringLiteral(s) = &m.expression {
+                    let prop = s.value.display().to_string();
+                    Self::member(cx, m.span, &m.object, &prop);
                 }
             }
+
             AstKind::CallExpression(call) => {
                 let Some(path) = member_path(&call.callee) else {
                     return;
@@ -230,9 +252,12 @@ impl Rule for DomStateRule {
                 }
             }
             AstKind::AssignmentExpression(a) => {
-                // Bare `location = "…"`.
-                if let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left
-                    && id.name == "location"
+                // `location = "…"`, `window.location = "…"`.
+                if let Some(path) = target_path(&a.left)
+                    && matches!(
+                        path.as_str(),
+                        "location" | "window.location" | "document.location" | "top.location"
+                    )
                 {
                     cx.report(
                         a.span,
@@ -271,21 +296,55 @@ impl NetworkRule {
                 keys.push(format!("method={m}"));
                 continue;
             }
-            if key == "headers"
-                && let Expression::ObjectExpression(h) = &p.value
-            {
-                for hp in &h.properties {
-                    if let ObjectPropertyKind::ObjectProperty(hp) = hp
-                        && let Some(name) = key_name(&hp.key)
-                    {
-                        cx.report(hp.span, "Data/Headers", name);
+            if key == "headers" {
+                match &p.value {
+                    Expression::ObjectExpression(h) => {
+                        for hp in &h.properties {
+                            if let ObjectPropertyKind::ObjectProperty(hp) = hp
+                                && let Some(name) = key_name(&hp.key)
+                            {
+                                cx.report(hp.span, "Data/Headers", name);
+                            }
+                        }
                     }
+                    // `headers: [["X-Token", t], …]`
+                    Expression::ArrayExpression(arr) => {
+                        for el in &arr.elements {
+                            if let Some(Expression::ArrayExpression(pair)) = el.as_expression()
+                                && let Some(name) = pair
+                                    .elements
+                                    .first()
+                                    .and_then(|e| e.as_expression())
+                                    .and_then(string_value)
+                            {
+                                cx.report(pair.span, "Data/Headers", name);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             keys.push(key);
         }
         cx.report(obj.span, "Object Schemas/Fetch Options", keys.join(", "));
     }
+}
+
+/// `(method, url)` from a request config object such as `{url, method}`
+/// (axios) or `{url, type}` (jQuery).
+fn request_config(obj: &oxc_ast::ast::ObjectExpression<'_>) -> (Option<String>, Option<String>) {
+    let (mut verb, mut url) = (None, None);
+    for prop in &obj.properties {
+        let ObjectPropertyKind::ObjectProperty(p) = prop else {
+            continue;
+        };
+        match key_name(&p.key).as_deref() {
+            Some("method" | "type") => verb = string_value(&p.value),
+            Some("url") => url = string_value(&p.value),
+            _ => {}
+        }
+    }
+    (verb, url)
 }
 
 fn key_name(key: &PropertyKey<'_>) -> Option<String> {
@@ -345,12 +404,28 @@ impl Rule for NetworkRule {
                     }
                     return;
                 }
-                // $.ajax({url, type}) / jQuery.ajax
-                if matches!(path.as_str(), "$.ajax" | "jQuery.ajax") {
+                // $.ajax({url, type}), jQuery.ajax(…), axios({url, method}), axios.request({…})
+                if matches!(
+                    path.as_str(),
+                    "$.ajax" | "jQuery.ajax" | "axios" | "axios.request"
+                ) {
+                    let (verb, target) = match arg_expr(&call.arguments, 0) {
+                        Some(Expression::ObjectExpression(o)) => request_config(o),
+                        Some(e) => (None, string_value(e)),
+                        None => (None, None),
+                    };
+                    let default_verb = if path.starts_with("axios") {
+                        "GET"
+                    } else {
+                        "AJAX"
+                    };
                     cx.report(
                         call.span,
-                        "Client Behavior/Possible Rest Client/AJAX",
-                        cx.snippet(call.span),
+                        format!(
+                            "Client Behavior/Possible Rest Client/{}",
+                            verb.as_deref().unwrap_or(default_verb).to_ascii_uppercase()
+                        ),
+                        target.unwrap_or_else(|| cx.snippet(call.span)),
                     );
                     return;
                 }
@@ -480,6 +555,48 @@ mod tests {
             "Client Behavior/Storage/sessionStorage/debug",
             "sessionStorage.debug"
         ));
+    }
+
+    /// Codex M3 #4: computed members and `window.location =`.
+    #[test]
+    fn computed_members_and_location_object() {
+        let f = run(
+            DomStateRule,
+            r#"document["cookie"] = c; const n = window["name"]; window.location = u;"#,
+        );
+        assert!(has(
+            &f,
+            "Client Behavior/Storage/Cookie/Assignment",
+            "document.cookie"
+        ));
+        assert!(has(&f, "Client Behavior/window.name/Read", "window.name"));
+        assert!(
+            f.iter()
+                .any(|(c, _)| c == "Client Behavior/Location/Assignment/(self)")
+        );
+        let s = run(SinksRule, r#"el["innerHTML"] = x;"#);
+        assert_eq!(s.len(), 1);
+    }
+
+    /// Codex M3 #8: request config objects and tuple headers.
+    #[test]
+    fn request_configs() {
+        let f = run(
+            NetworkRule,
+            r#"axios({url: "/api/u", method: "patch"}); $.ajax({url: "/legacy", type: "POST"});
+               fetch(u, {headers: [["X-Token", t]]});"#,
+        );
+        assert!(has(
+            &f,
+            "Client Behavior/Possible Rest Client/PATCH",
+            "/api/u"
+        ));
+        assert!(has(
+            &f,
+            "Client Behavior/Possible Rest Client/POST",
+            "/legacy"
+        ));
+        assert!(has(&f, "Data/Headers", "X-Token"));
     }
 
     #[test]

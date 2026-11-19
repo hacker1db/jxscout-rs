@@ -42,7 +42,9 @@ impl<R: AsyncRead + Unpin + Send> IngestSource for UrlListSource<R> {
         while let Some(line) = lines.next_line().await? {
             match parse_line(&line) {
                 Ok(Some(url)) => {
-                    pipeline.submit(Captured::url_only(url, Origin::UrlList));
+                    pipeline
+                        .submit_wait(Captured::url_only(url, Origin::UrlList))
+                        .await;
                     report.submitted += 1;
                 }
                 Ok(None) => {}

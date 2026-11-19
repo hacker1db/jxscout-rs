@@ -131,7 +131,10 @@ impl Fetcher {
             .user_agent(cfg.user_agent.clone())
             .timeout(cfg.timeout)
             // We follow redirects ourselves, see module docs.
-            .redirect(reqwest::redirect::Policy::none());
+            .redirect(reqwest::redirect::Policy::none())
+            // An HTTP(S)_PROXY from the environment would resolve hostnames
+            // itself and bypass the guarded resolver below (R-56).
+            .no_proxy();
         if !cfg.allow_private_targets {
             builder = builder.dns_resolver(Arc::new(GuardedResolver));
         }
@@ -227,17 +230,20 @@ impl Fetcher {
     ) -> Result<FetchResponse, FetchError> {
         // Fail fast without consuming a rate-limit slot.
         self.check_target(url, ctx)?;
-        let _permit = self
-            .inner
-            .permits
-            .acquire()
-            .await
-            .expect("semaphore is never closed");
         let retries = self.inner.cfg.retries;
         let mut attempt = 0;
         loop {
-            self.inner.limiter.acquire().await;
-            let result = self.get_once(url, ctx).await;
+            // Hold a concurrency permit only while a request is in flight,
+            // not while sleeping between retries.
+            let result = {
+                let _permit = self
+                    .inner
+                    .permits
+                    .acquire()
+                    .await
+                    .expect("semaphore is never closed");
+                self.get_once(url, ctx).await
+            };
             let retry = match &result {
                 Ok(r) => r.status == 429 || (500..600).contains(&r.status),
                 Err(e) => e.is_transient(),
@@ -253,19 +259,35 @@ impl Fetcher {
     }
 
     /// One attempt, following redirects manually.
+    ///
+    /// Every hop is policy-checked and rate-limited. Once a redirect leaves
+    /// the origin of the first request, no credentials (captured or static)
+    /// are sent again for the rest of the chain — even if a later hop comes
+    /// back to an in-scope origin.
     async fn get_once(
         &self,
         url: &Url,
         ctx: &FetchContext<'_>,
     ) -> Result<FetchResponse, FetchError> {
+        let first_origin = url.origin();
+        let mut send_credentials = true;
         let mut current = url.clone();
         for _hop in 0..=self.inner.cfg.max_redirects {
             self.check_target(&current, ctx)?;
+            if current.origin() != first_origin {
+                send_credentials = false;
+            }
+            let headers = if send_credentials {
+                self.headers_for(&current, ctx)
+            } else {
+                HeaderMap::new()
+            };
+            self.inner.limiter.acquire().await;
             let resp = self
                 .inner
                 .client
                 .get(current.clone())
-                .headers(self.headers_for(&current, ctx))
+                .headers(headers)
                 .send()
                 .await?;
 

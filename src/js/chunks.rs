@@ -73,19 +73,8 @@ pub fn discover(program: &Program<'_>, script_url: &Url, limits: Limits) -> Disc
         }
     };
 
-    // Webpack chunk filenames.
-    for (name, brute) in &v.webpack_names {
-        if !is_js_path(name) {
-            continue;
-        }
-        if let Some(url) = resolve_webpack(script_url, public_path.as_deref(), name)
-            && push(url, &mut out)
-        {
-            out.bruteforced |= *brute;
-        }
-    }
-
-    // ESM specifiers.
+    // Explicit references first, so heuristic webpack candidates can't
+    // crowd them out of the URL budget.
     for spec in &v.esm_specifiers {
         if let Some(url) = resolve_esm(script_url, spec) {
             push(url, &mut out);
@@ -97,6 +86,14 @@ pub fn discover(program: &Program<'_>, script_url: &Url, limits: Limits) -> Disc
             push(url, &mut out);
         }
     }
+    // Webpack chunk filenames.
+    for (name, brute) in &v.webpack_names {
+        if let Some(url) = resolve_webpack(script_url, public_path.as_deref(), name)
+            && push(url, &mut out)
+        {
+            out.bruteforced |= *brute;
+        }
+    }
     out
 }
 
@@ -105,8 +102,15 @@ fn is_js_path(s: &str) -> bool {
     [".js", ".mjs", ".cjs"].iter().any(|e| path.ends_with(e))
 }
 
+/// Plausible `__webpack_require__.p` values: absolute URLs, root paths, or
+/// relative directory prefixes. Webpack's `"auto"` is resolved at runtime,
+/// so it is ignored (we fall back to the script location).
 fn looks_like_public_path(p: &str) -> bool {
-    p.is_empty() || p.starts_with('/') || p.starts_with("http://") || p.starts_with("https://")
+    p.is_empty()
+        || p.starts_with('/')
+        || p.starts_with("http://")
+        || p.starts_with("https://")
+        || (p.ends_with('/') && !p.contains(char::is_whitespace))
 }
 
 /// Resolve a webpack chunk filename.
@@ -122,8 +126,10 @@ pub fn resolve_webpack(script_url: &Url, public_path: Option<&str>, name: &str) 
         return script_url.join(name).ok();
     }
     if let Some(pp) = public_path.filter(|p| !p.is_empty()) {
-        let base = script_url.join(pp).ok()?;
-        return base.join(name.trim_start_matches('/')).ok();
+        // Webpack builds the URL by plain string concatenation:
+        // `__webpack_require__.p + filename`. A relative public path is
+        // relative to the page; we approximate with the script URL.
+        return script_url.join(&format!("{pp}{name}")).ok();
     }
     if name.starts_with('/') {
         return script_url.join(name).ok();
@@ -145,7 +151,14 @@ pub fn resolve_webpack(script_url: &Url, public_path: Option<&str>, name: &str) 
 pub fn resolve_esm(script_url: &Url, spec: &str) -> Option<Url> {
     let is_url = spec.starts_with("http://") || spec.starts_with("https://");
     let is_relative = spec.starts_with("./") || spec.starts_with("../") || spec.starts_with('/');
-    if !(is_url || is_relative) || !is_js_path(spec) {
+    if !(is_url || is_relative) {
+        return None;
+    }
+    // `./bootstrap` (no extension) is a valid module URL; `./styles.css`
+    // or `./data.json` imports are not scripts.
+    let path = spec.split(['?', '#']).next().unwrap_or(spec);
+    let last = path.rsplit('/').next().unwrap_or(path);
+    if last.contains('.') && !is_js_path(spec) {
         return None;
     }
     script_url.join(spec).ok()
@@ -181,6 +194,11 @@ struct Collector {
     public_paths: Vec<String>,
     /// Evaluated chunk filenames, and whether they came from brute force.
     webpack_names: Vec<(String, bool)>,
+    /// De-duplicates `webpack_names`.
+    names_seen: BTreeSet<String>,
+    /// Total evaluations so far; bounded so a script full of one-argument
+    /// string formatters can't burn CPU (R-36).
+    evaluations: usize,
     esm_specifiers: Vec<String>,
     preload_deps: Vec<String>,
 }
@@ -191,6 +209,8 @@ impl Collector {
             limits,
             public_paths: Vec::new(),
             webpack_names: Vec::new(),
+            names_seen: BTreeSet::new(),
+            evaluations: 0,
             esm_specifiers: Vec::new(),
             preload_deps: Vec::new(),
         }
@@ -210,12 +230,17 @@ impl Collector {
         } else {
             Box::new(info.keys.into_iter())
         };
+        let budget = self.limits.max_urls + self.limits.bruteforce as usize;
         for id in ids {
-            if self.webpack_names.len() >= self.limits.max_urls {
+            if self.webpack_names.len() >= self.limits.max_urls || self.evaluations >= budget {
                 break;
             }
+            self.evaluations += 1;
             let ev = Evaluator { param, key: &id };
-            if let Some(name) = ev.eval(expr) {
+            if let Some(name) = ev.eval(expr)
+                && is_js_path(&name)
+                && self.names_seen.insert(name.clone())
+            {
                 self.webpack_names.push((name, brute));
             }
         }
@@ -377,7 +402,12 @@ impl ExprInfo {
                     is_param(&m.expression, param),
                 ) {
                     self.uses_param = true;
-                    self.keys.extend(object_table(obj).into_keys());
+                    let table = object_table(obj);
+                    // `{1:"page.js"}[id]`: the `.js` may live in the values.
+                    if table.values().any(|v| v.contains(".js")) {
+                        self.has_js_literal = true;
+                    }
+                    self.keys.extend(table.into_keys());
                 } else {
                     self.scan(&m.object, param);
                 }
@@ -597,6 +627,48 @@ mod tests {
         assert!(!got.iter().any(|u| u.contains("react")), "{got:?}");
         // de-duplicated
         assert_eq!(got.len(), 4);
+    }
+
+    /// Codex M3 #1: filenames that live entirely in the table.
+    #[test]
+    fn table_only_filenames() {
+        let d = run(
+            r#"r.u = e => ({1:"page.abc.js",2:"vendor.def.js"})[e];"#,
+            "https://app.test/js/main.js",
+        );
+        assert_eq!(
+            strs(&d),
+            vec![
+                "https://app.test/js/page.abc.js",
+                "https://app.test/js/vendor.def.js"
+            ]
+        );
+    }
+
+    /// Codex M3 #2: relative public paths are concatenated like webpack does.
+    #[test]
+    fn relative_public_path() {
+        let d = run(
+            r#"r.p = "../chunks/"; r.u = e => e + "." + {7:"h"}[e] + ".js";"#,
+            "https://app.test/app/js/main.js",
+        );
+        assert_eq!(strs(&d), vec!["https://app.test/app/chunks/7.h.js"]);
+    }
+
+    /// Codex M2 #13: extensionless relative imports are followed; CSS isn't.
+    #[test]
+    fn extensionless_imports() {
+        let d = run(
+            r#"import("./bootstrap"); import "./styles.css"; import x from "../lib/util";"#,
+            "https://app.test/a/b/main.js",
+        );
+        assert_eq!(
+            strs(&d),
+            vec![
+                "https://app.test/a/b/bootstrap",
+                "https://app.test/a/lib/util"
+            ]
+        );
     }
 
     #[test]

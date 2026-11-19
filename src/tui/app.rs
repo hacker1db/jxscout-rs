@@ -67,6 +67,8 @@ pub struct HeaderInfo {
     pub project: String,
     pub project_dir: String,
     pub listen: Option<String>,
+    /// Ingest token, shown so it can be pasted into the proxy plugin.
+    pub token: Option<String>,
 }
 
 pub struct App {
@@ -139,6 +141,14 @@ impl App {
             .map(|&i| &self.assets[i])
     }
 
+    /// Select the visible row showing `url`, or the first row if it's gone.
+    pub fn select_url(&mut self, url: Option<&str>) {
+        let visible = self.visible_assets();
+        let pos = url.and_then(|u| visible.iter().position(|&i| self.assets[i].url == u));
+        self.assets_state
+            .select(pos.or((!visible.is_empty()).then_some(0)));
+    }
+
     pub fn push_log(&mut self, line: String) {
         if self.logs.len() == LOG_CAP {
             self.logs.pop_front();
@@ -154,7 +164,7 @@ impl App {
     pub fn on_event(&mut self, event: Event) -> bool {
         match event {
             Event::Log { level, message } => {
-                self.push_log(format!("{level:>5} {message}"));
+                self.push_log(format!("{level:>5} {}", crate::text::clean(&message)));
                 false
             }
             Event::AssetSaved { url, kind, path } => {
@@ -216,6 +226,8 @@ impl App {
                 }
                 KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(PAGE as u16),
                 KeyCode::Home | KeyCode::Char('g') => self.help_scroll = 0,
+                // Clamped to the real content height when drawn.
+                KeyCode::End | KeyCode::Char('G') => self.help_scroll = u16::MAX,
                 _ => {}
             }
             return Action::None;
@@ -374,6 +386,20 @@ mod tests {
         app.on_key(key(KeyCode::Esc));
         assert!(!app.show_help);
         assert_eq!(app.on_key(key(KeyCode::Char('q'))), Action::Quit);
+    }
+
+    /// Codex M3 #3: a resync that reorders rows keeps the same asset.
+    #[test]
+    fn select_url_survives_reorder() {
+        let mut app = App::new(HeaderInfo::default());
+        saved(&mut app, "https://a.test/1.js");
+        saved(&mut app, "https://a.test/2.js");
+        app.select_url(Some("https://a.test/1.js"));
+        app.assets.reverse();
+        app.select_url(Some("https://a.test/1.js"));
+        assert_eq!(app.selected_asset().unwrap().url, "https://a.test/1.js");
+        app.select_url(Some("https://gone.test/x.js"));
+        assert_eq!(app.assets_state.selected(), Some(0));
     }
 
     #[test]

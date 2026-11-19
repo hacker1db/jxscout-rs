@@ -208,6 +208,21 @@ impl Db {
         rows.collect()
     }
 
+    /// Like [`assets`](Self::assets) with each asset's finding count, in
+    /// one query (the TUI loads thousands of rows at once).
+    pub fn assets_with_counts(&self, limit: usize) -> rusqlite::Result<Vec<(AssetRow, usize)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT a.url, a.kind, a.path, a.sha256, a.size, a.origin, a.parent_url,
+                    (SELECT COUNT(*) FROM findings f WHERE f.asset_url = a.url)
+             FROM assets a ORDER BY a.updated_at DESC, a.url LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            Ok((row_to_asset(r)?, r.get::<_, i64>(7)? as usize))
+        })?;
+        rows.collect()
+    }
+
     /// Scripts loaded by an HTML page (`loads` command).
     pub fn scripts_of(&self, page_url: &str) -> rusqlite::Result<Vec<String>> {
         self.strings(

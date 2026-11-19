@@ -19,11 +19,12 @@ use jxscout::config::{Config, DiscoveryConfig, FetchConfig, ForwardAuth};
 use jxscout::events::{EventBus, LogLayer};
 use jxscout::ingest::IngestSource as _;
 use jxscout::ingest::har::HarSource;
-use jxscout::ingest::server::{ServerSource, check_bind_addr};
+use jxscout::ingest::server::{ServerConfig, ServerSource, check_bind_addr};
 use jxscout::ingest::urls::UrlListSource;
 use jxscout::rules::{self, Registry};
 use jxscout::scope::Scope;
 use jxscout::store::{Db, validate_project_name};
+use jxscout::text::clean;
 use jxscout::{Pipeline, tui};
 
 #[derive(Parser, Debug)]
@@ -192,9 +193,14 @@ struct ServeArgs {
     /// Headless mode: logs to stderr, no TUI.
     #[arg(long)]
     no_tui: bool,
-    /// Require `Authorization: Bearer <token>` on ingest requests.
+    /// Bearer token required on ingest requests. Default: a random token
+    /// generated once and stored in <output-dir>/.jxscout-rs/ingest-token.
     #[arg(long, env = "JXSCOUT_INGEST_TOKEN")]
     ingest_token: Option<String>,
+    /// Disable ingest authentication (any local process or web page that
+    /// reaches the port can submit traffic).
+    #[arg(long, conflicts_with = "ingest_token")]
+    no_auth: bool,
     /// Allow listening on non-loopback addresses.
     #[arg(long)]
     allow_remote_ingest: bool,
@@ -207,6 +213,7 @@ impl Default for ServeArgs {
             port: 3333,
             no_tui: false,
             ingest_token: std::env::var("JXSCOUT_INGEST_TOKEN").ok(),
+            no_auth: false,
             allow_remote_ingest: false,
         }
     }
@@ -344,9 +351,26 @@ async fn serve(cfg: Config, args: ServeArgs, debug: bool) -> anyhow::Result<()> 
 
     let pipeline = Pipeline::new(cfg, bus)?;
     let shutdown = CancellationToken::new();
+    let token = if args.no_auth {
+        tracing::warn!("ingest authentication disabled (--no-auth)");
+        None
+    } else {
+        Some(match args.ingest_token {
+            Some(t) => t,
+            None => load_or_create_token(&pipeline.config().output_dir)?,
+        })
+    };
+    let server_config = if args.allow_remote_ingest {
+        ServerConfig {
+            token: token.clone(),
+            allowed_hosts: None,
+        }
+    } else {
+        ServerConfig::loopback(local, &args.hostname, token.clone())
+    };
     let server = ServerSource {
         listener,
-        token: args.ingest_token,
+        config: server_config,
         shutdown: shutdown.clone(),
     };
     let server_task = tokio::spawn(server.run(pipeline.clone()));
@@ -364,6 +388,7 @@ async fn serve(cfg: Config, args: ServeArgs, debug: bool) -> anyhow::Result<()> 
             project: pipeline.config().project.clone(),
             project_dir: pipeline.store().root().display().to_string(),
             listen: Some(format!("http://{local}/ingest")),
+            token: token.clone(),
         };
         tui::run(pipeline.clone(), header, shutdown.clone()).await?;
         shutdown.cancel();
@@ -373,12 +398,39 @@ async fn serve(cfg: Config, args: ServeArgs, debug: bool) -> anyhow::Result<()> 
             log = %log_path.display(),
             "jxscout-rs ready on http://{local}/ingest (Ctrl-C to stop)"
         );
+        if let Some(t) = &token {
+            eprintln!("ingest token: {t}  (send `Authorization: Bearer {t}`)");
+        }
         shutdown.cancelled().await;
     }
     server_task.await??;
     // Give in-flight work a moment to finish writing.
     let _ = tokio::time::timeout(Duration::from_secs(2), pipeline.wait_idle()).await;
     Ok(())
+}
+
+/// Read the persisted ingest token, or create one (mode 0600 on Unix).
+fn load_or_create_token(output_dir: &Path) -> anyhow::Result<String> {
+    let path = output_dir.join(".jxscout-rs").join("ingest-token");
+    if let Ok(t) = std::fs::read_to_string(&path) {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Ok(t);
+        }
+    }
+    let token = jxscout::ingest::server::generate_token();
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    use std::io::Write as _;
+    opts.open(&path)
+        .and_then(|mut f| f.write_all(token.as_bytes()))
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(token)
 }
 
 fn open_db(cfg: &Config) -> anyhow::Result<Db> {
@@ -411,7 +463,7 @@ fn analyze_file(file: &Path, json: bool) -> anyhow::Result<()> {
                 f.line,
                 f.column,
                 f.category,
-                f.value
+                clean(&f.value)
             );
         }
         eprintln!("{} finding(s)", findings.len());
@@ -476,18 +528,23 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else {
                 for r in rows {
-                    println!("{:<6} {}  →  {}", r.kind.as_str(), r.url, r.path);
+                    println!(
+                        "{:<6} {}  →  {}",
+                        r.kind.as_str(),
+                        clean(&r.url),
+                        clean(&r.path)
+                    );
                 }
             }
         }
         Command::Loads { page_url } => {
             for s in open_db(&cfg)?.scripts_of(&page_url)? {
-                println!("{s}");
+                println!("{}", clean(&s));
             }
         }
         Command::Loaded { script_url } => {
             for p in open_db(&cfg)?.pages_of(&script_url)? {
-                println!("{p}");
+                println!("{}", clean(&p));
             }
         }
         Command::Findings {
@@ -502,7 +559,11 @@ async fn main() -> anyhow::Result<()> {
                 for f in &rows {
                     println!(
                         "{}:{}:{}  {}  {}",
-                        f.asset_url, f.line, f.column, f.category, f.value
+                        clean(&f.asset_url),
+                        f.line,
+                        f.column,
+                        clean(&f.category),
+                        clean(&f.value)
                     );
                 }
                 eprintln!("{} finding(s)", rows.len());

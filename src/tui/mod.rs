@@ -17,25 +17,24 @@ use tokio_util::sync::CancellationToken;
 use crate::pipeline::Pipeline;
 use app::{Action, App, AssetItem, HeaderInfo};
 
+/// (Re)load the asset list, keeping the same asset selected by URL so a
+/// reordered snapshot can't silently switch the findings pane to another
+/// asset.
 fn load_assets(pipeline: &Pipeline, app: &mut App) {
-    match pipeline.db().assets(None, 10_000, 0) {
+    let selected_url = app.selected_asset().map(|a| a.url.clone());
+    match pipeline.db().assets_with_counts(10_000) {
         Ok(rows) => {
             app.assets = rows
                 .into_iter()
-                .map(|r| {
-                    let findings = pipeline.db().finding_count(&r.url).unwrap_or(0);
-                    AssetItem {
-                        findings,
-                        ..AssetItem::from(r)
-                    }
+                .map(|(r, findings)| AssetItem {
+                    findings,
+                    ..AssetItem::from(r)
                 })
                 .collect();
         }
         Err(e) => app.push_log(format!("ERROR loading assets: {e}")),
     }
-    if app.assets_state.selected().is_none() && !app.assets.is_empty() {
-        app.assets_state.select(Some(0));
-    }
+    app.select_url(selected_url.as_deref());
 }
 
 fn reload_findings(pipeline: &Pipeline, app: &mut App) {
@@ -83,7 +82,10 @@ pub async fn run(
                 ev = events.recv() => match ev {
                     Ok(ev) => if app.on_event(ev) { reload_findings(&pipeline, &mut app) },
                     // We fell behind a burst of events: resync from the DB.
-                    Err(RecvError::Lagged(_)) => load_assets(&pipeline, &mut app),
+                    Err(RecvError::Lagged(_)) => {
+                        load_assets(&pipeline, &mut app);
+                        reload_findings(&pipeline, &mut app);
+                    }
                     Err(RecvError::Closed) => break,
                 },
                 _ = tick.tick() => app.stats = pipeline.stats(),

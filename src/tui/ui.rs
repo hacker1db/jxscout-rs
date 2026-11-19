@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 
 use super::app::{App, Focus};
 use crate::events::AssetKind;
+use crate::text::clean;
 
 pub const HELP: &str = "\
 jxscout-rs — keys
@@ -114,6 +115,16 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
 
     if app.show_help {
         let popup = centered(area, 70, area.height.saturating_sub(2).max(6));
+        // Clamp scrolling to the wrapped content so PgDn/End can't scroll
+        // into blank space (Codex M3 #9).
+        let inner_w = popup.width.saturating_sub(2).max(1) as usize;
+        let inner_h = popup.height.saturating_sub(2) as usize;
+        let content_lines: usize = HELP
+            .lines()
+            .map(|l| l.chars().count().max(1).div_ceil(inner_w))
+            .sum();
+        let max_scroll = content_lines.saturating_sub(inner_h) as u16;
+        app.help_scroll = app.help_scroll.min(max_scroll);
         f.render_widget(Clear, popup);
         let p = Paragraph::new(HELP)
             .block(pane_block(
@@ -135,6 +146,12 @@ fn draw_header(f: &mut Frame<'_>, app: &App, area: Rect) {
     ];
     if let Some(l) = &app.header.listen {
         spans.push(Span::raw(format!("  ingest: {l}")));
+    }
+    if let Some(t) = &app.header.token {
+        spans.push(Span::styled(
+            format!("  token: {t}"),
+            Style::new().fg(Color::Yellow),
+        ));
     }
     spans.push(Span::raw(format!(
         "  saved {} · findings {} · chunks {} · maps {} · errors {}",
@@ -176,7 +193,7 @@ fn draw_assets(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                     format!("[{:>3}] ", a.findings),
                     Style::new().fg(Color::Cyan),
                 ),
-                Span::raw(a.url.clone()),
+                Span::raw(clean(&a.url).into_owned()),
             ]))
         })
         .collect();
@@ -203,17 +220,20 @@ fn draw_findings(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .iter()
         .map(|fd| {
             ListItem::new(Line::from(vec![
-                Span::styled(fd.category.clone(), Style::new().fg(Color::Green)),
+                Span::styled(
+                    clean(&fd.category).into_owned(),
+                    Style::new().fg(Color::Green),
+                ),
                 Span::styled(
                     format!(" {}:{} ", fd.line, fd.column),
                     Style::new().fg(Color::DarkGray),
                 ),
-                Span::raw(fd.value.replace('\n', "⏎")),
+                Span::raw(clean(&fd.value.replace('\n', "⏎")).into_owned()),
             ]))
         })
         .collect();
     let title = match app.selected_asset() {
-        Some(a) => format!(" findings ({}) — {} ", app.findings.len(), a.path),
+        Some(a) => format!(" findings ({}) — {} ", app.findings.len(), clean(&a.path)),
         None => " findings ".to_string(),
     };
     let list = List::new(items)
@@ -248,6 +268,7 @@ mod tests {
             project: "demo".into(),
             project_dir: "/tmp/demo".into(),
             listen: Some("127.0.0.1:3333".into()),
+            token: None,
         });
         for i in 0..50 {
             app.on_event(Event::AssetSaved {
@@ -315,5 +336,10 @@ mod tests {
         let scrolled = render(&mut app, 80, 14);
         assert!(!scrolled.contains("jxscout-rs — keys"));
         assert!(scrolled.contains("Panes") || scrolled.contains("Assets"));
+        // End clamps to the last page instead of a blank popup.
+        app.help_scroll = u16::MAX;
+        let end = render(&mut app, 40, 12);
+        assert!(app.help_scroll < u16::MAX);
+        assert!(end.contains("(sourcemaps)"), "last line visible:\n{end}");
     }
 }

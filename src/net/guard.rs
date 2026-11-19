@@ -50,14 +50,38 @@ fn is_forbidden_v4(ip: Ipv4Addr) -> bool {
 }
 
 fn is_forbidden_v6(ip: Ipv6Addr) -> bool {
-    let seg0 = ip.segments()[0];
-    ip.is_loopback()
+    let seg = ip.segments();
+    if ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_multicast()
-        || (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique local
-        || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 link local
-        || (seg0 == 0x2001 && ip.segments()[1] == 0x0db8) // documentation
-        || ip.to_ipv4().is_some_and(is_forbidden_v4) // IPv4-compatible ::a.b.c.d
+        || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
+        || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link local
+        || (seg[0] & 0xffc0) == 0xfec0 // fec0::/10 site local (deprecated)
+        || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
+        || (seg[0] == 0x2001 && seg[1] == 0x0000)
+    // 2001::/32 Teredo: tunnels to an arbitrary IPv4 host; block outright
+    {
+        return true;
+    }
+    // Forms that embed an IPv4 address: judge the embedded address.
+    embedded_v4(ip).is_some_and(is_forbidden_v4)
+}
+
+/// Extract an IPv4 address embedded in well-known IPv6 transition prefixes.
+fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let seg = ip.segments();
+    let v4 = |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
+    match seg {
+        // ::a.b.c.d (deprecated IPv4-compatible); `::` and `::1` handled above
+        [0, 0, 0, 0, 0, 0, hi, lo] => Some(v4(hi, lo)),
+        // 64:ff9b::/96 NAT64 well-known prefix
+        [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] => Some(v4(hi, lo)),
+        // 64:ff9b:1::/48 local-use NAT64: IPv4 in the last 32 bits
+        [0x64, 0xff9b, 1, _, _, _, hi, lo] => Some(v4(hi, lo)),
+        // 2002::/16 6to4: IPv4 in bits 16..48
+        [0x2002, hi, lo, ..] => Some(v4(hi, lo)),
+        _ => None,
+    }
 }
 
 /// Reject IP-literal hosts that are forbidden. Hostnames are checked later by
@@ -130,6 +154,15 @@ mod tests {
             "fd00::1",
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
+            // embedded IPv4 transition forms
+            "64:ff9b::7f00:1",     // NAT64 → 127.0.0.1
+            "64:ff9b::a9fe:a9fe",  // NAT64 → 169.254.169.254
+            "64:ff9b:1::a00:1",    // local NAT64 → 10.0.0.1
+            "2002:7f00:1::1",      // 6to4 → 127.0.0.1
+            "2002:c0a8:101::1",    // 6to4 → 192.168.1.1
+            "2001:0:4136:e378::1", // Teredo
+            "::7f00:1",            // IPv4-compatible → 127.0.0.1
+            "fec0::1",             // site local
         ] {
             assert!(is_forbidden_ip(ip(bad)), "{bad} should be forbidden");
         }
@@ -137,7 +170,13 @@ mod tests {
 
     #[test]
     fn public_addresses() {
-        for good in ["1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {
+        for good in [
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+            "64:ff9b::101:101", // NAT64 → 1.1.1.1 is public
+            "2002:101:101::1",  // 6to4 → 1.1.1.1
+        ] {
             assert!(!is_forbidden_ip(ip(good)), "{good} should be allowed");
         }
     }

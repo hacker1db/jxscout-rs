@@ -34,6 +34,11 @@ impl AssetStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let root = output_dir.join(project);
         std::fs::create_dir_all(&root)?;
+        // The output dir itself may be a symlink the user chose, but the
+        // project dir inside it must be a real directory (R-33).
+        if std::fs::symlink_metadata(&root)?.file_type().is_symlink() {
+            return Err(symlink_error(&root));
+        }
         Ok(Self { root })
     }
 
@@ -96,8 +101,20 @@ impl AssetStore {
         let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
         tmp_name.push(format!(".tmp-{}-{n}", std::process::id()));
         let tmp = target.with_file_name(tmp_name);
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, &target)?;
+        // `create_new` (O_EXCL) fails instead of following a symlink that
+        // someone planted at the temp path.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            f.write_all(bytes)?;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &target) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         used.push(used_name);
         Ok(used)
     }
@@ -190,6 +207,22 @@ mod tests {
         let store = AssetStore::new(tmp.path(), "p").unwrap();
         assert!(store.write(Path::new("../escape.js"), b"x").is_err());
         assert!(store.write(Path::new("/abs.js"), b"x").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_project_dir_and_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("proj")).unwrap();
+        assert!(AssetStore::new(tmp.path(), "proj").is_err());
+
+        let store = AssetStore::new(tmp.path(), "ok").unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, b"keep").unwrap();
+        std::os::unix::fs::symlink(&secret, store.root().join("x.js")).unwrap();
+        assert!(store.write(Path::new("x.js"), b"overwrite").is_err());
+        assert_eq!(std::fs::read(&secret).unwrap(), b"keep");
     }
 
     #[cfg(unix)]

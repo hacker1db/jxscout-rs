@@ -19,6 +19,7 @@
 //! | [`pipeline`] | glues everything together (R-40..R-43) |
 //! | [`ingest`] | ingest sources: HTTP endpoint, URL lists, HAR files (R-10..R-14) |
 //! | [`events`] | progress events consumed by the TUI and logs |
+//! | [`text`] | escaping untrusted text before it reaches a terminal |
 //! | [`tui`] | the ratatui terminal UI (R-90, R-91) |
 
 pub mod config;
@@ -31,6 +32,7 @@ pub mod pipeline;
 pub mod rules;
 pub mod scope;
 pub mod store;
+pub mod text;
 pub mod tui;
 
 pub use config::Config;

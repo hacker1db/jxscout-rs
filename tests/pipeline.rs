@@ -7,7 +7,7 @@ use jxscout::config::ForwardAuth;
 use jxscout::model::{Captured, Origin};
 use jxscout::scope::Scope;
 use url::Url;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const RUNTIME: &str = r#"
@@ -414,4 +414,94 @@ async fn unchanged_assets_are_skipped() {
     run(&p, item).await;
     let s = p.stats();
     assert_eq!((s.saved, s.unchanged), (1, 1));
+}
+
+/// Codex M2 #2: once a redirect chain leaves the first origin, credentials
+/// are never re-sent, even when it comes back.
+#[tokio::test]
+async fn credentials_are_not_resent_after_leaving_the_origin() {
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+    Mock::given(path("/js/1.x.js"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", format!("{}/bounce", b.uri())),
+        )
+        .mount(&a)
+        .await;
+    Mock::given(path("/bounce"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/js/final.js", a.uri())),
+        )
+        .mount(&b)
+        .await;
+    Mock::given(header_exists("cookie"))
+        .respond_with(ResponseTemplate::new(418))
+        .expect(0)
+        .mount(&b)
+        .await;
+    Mock::given(path("/js/final.js"))
+        .and(header_exists("cookie"))
+        .respond_with(ResponseTemplate::new(418))
+        .expect(0)
+        .with_priority(1)
+        .mount(&a)
+        .await;
+    Mock::given(path("/js/final.js"))
+        .respond_with(js("ok()"))
+        .with_priority(2)
+        .mount(&a)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = offline_config(tmp.path());
+    cfg.fetch.forward_auth = ForwardAuth::InScope;
+    cfg.scope = Scope::from_patterns(["127.0.0.1"]);
+    let p = pipeline(cfg);
+    let runtime = r#"r.u = e => "js/" + e + "." + {1:"x"}[e] + ".js";"#;
+    run(
+        &p,
+        captured(
+            &format!("{}/js/main.js", a.uri()),
+            "application/javascript",
+            runtime,
+            &[("Cookie", "s=1")],
+        ),
+    )
+    .await;
+    // Saved under the requested URL, resolved through the redirect chain.
+    assert!(read(&p, &format!("{}/js/1.x.js", host_dir(&a))).is_some());
+}
+
+/// Codex M2 #7: relative references resolve against the final URL after
+/// a redirect, not the requested one.
+#[tokio::test]
+async fn redirected_pages_resolve_against_final_url() {
+    let server = MockServer::start().await;
+    Mock::given(path("/old"))
+        .respond_with(ResponseTemplate::new(301).insert_header("location", "/app/index.html"))
+        .mount(&server)
+        .await;
+    Mock::given(path("/app/index.html"))
+        .respond_with(html(r#"<script src="main.js"></script>"#))
+        .mount(&server)
+        .await;
+    Mock::given(path("/app/main.js"))
+        .respond_with(js("x()"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let p = pipeline(offline_config(tmp.path()));
+    let item = Captured::url_only(
+        Url::parse(&format!("{}/old", server.uri())).unwrap(),
+        Origin::UrlList,
+    );
+    run(&p, item).await;
+    assert!(
+        read(&p, &format!("{}/app/main.js", host_dir(&server))).is_some(),
+        "{:?} {:?}",
+        p.stats(),
+        p.db().assets(None, 10, 0)
+    );
 }

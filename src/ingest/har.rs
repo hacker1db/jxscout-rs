@@ -121,7 +121,7 @@ impl IngestSource for HarSource {
         for entry in self.har.log.entries {
             match entry_to_captured(entry) {
                 Ok(c) => {
-                    pipeline.submit(c);
+                    pipeline.submit_wait(c).await;
                     report.submitted += 1;
                 }
                 Err(e) => {

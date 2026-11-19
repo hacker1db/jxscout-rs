@@ -46,6 +46,16 @@ static MIME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(application|text|image|audio|video|multipart|font)/[A-Za-z0-9][A-Za-z0-9.+\-]*$")
         .unwrap()
 });
+/// A bare hostname. The TLD must be one of a curated list, otherwise
+/// every dotted identifier (`user.name`, `config.json`) would match.
+static HOST_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"^(?i)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+",
+        r"(?:com|net|org|io|dev|app|co|ai|gov|edu|mil|info|biz|me|us|uk|de|fr|nl|jp|cn|ru|br|in|au|ca|eu|",
+        r"xyz|cloud|tech|site|online|test|local|internal|corp|lan|cloudfront\.net|amazonaws\.com)$"
+    ))
+    .unwrap()
+});
 static GRAPHQL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(query|mutation|subscription|fragment)\b[^{]*\{").unwrap());
 
@@ -93,6 +103,9 @@ impl Rule for StringsRule {
             cx.report(span, category, text);
         } else if MIME_RE.is_match(text) {
             cx.report(span, "Data/MIME Type", text);
+            return;
+        } else if HOST_RE.is_match(text) {
+            cx.report(span, "Data/Hostname", text.to_ascii_lowercase());
             return;
         } else {
             return;
@@ -246,6 +259,23 @@ mod tests {
         assert!(
             !f.iter()
                 .any(|(_, v)| v == "hello world" || v == "//not-a-path")
+        );
+    }
+
+    /// Codex M3 #10: standalone hostnames, without dotted-identifier noise.
+    #[test]
+    fn standalone_hostnames() {
+        let f = run(
+            StringsRule,
+            r#"const a = "api.example.com"; const b = "internal.corp"; const c = "user.name";
+               const d = "config.json"; const e = "app.bundle.js";"#,
+        );
+        assert!(has(&f, "Data/Hostname", "api.example.com"));
+        assert!(has(&f, "Data/Hostname", "internal.corp"));
+        assert_eq!(
+            f.iter().filter(|(c, _)| c == "Data/Hostname").count(),
+            2,
+            "{f:?}"
         );
     }
 

@@ -30,22 +30,18 @@ pub fn pipeline(cfg: Config) -> Pipeline {
     Pipeline::new(cfg, EventBus::default()).expect("pipeline")
 }
 
+// `set_body_raw` sets the body *and* its Content-Type; `set_body_string`
+// would silently reset Content-Type to text/plain.
 pub fn js(body: &str) -> ResponseTemplate {
-    ResponseTemplate::new(200)
-        .insert_header("content-type", "application/javascript")
-        .set_body_string(body)
+    ResponseTemplate::new(200).set_body_raw(body.as_bytes().to_vec(), "application/javascript")
 }
 
 pub fn html(body: &str) -> ResponseTemplate {
-    ResponseTemplate::new(200)
-        .insert_header("content-type", "text/html; charset=utf-8")
-        .set_body_string(body)
+    ResponseTemplate::new(200).set_body_raw(body.as_bytes().to_vec(), "text/html; charset=utf-8")
 }
 
 pub fn json(body: &str) -> ResponseTemplate {
-    ResponseTemplate::new(200)
-        .insert_header("content-type", "application/json")
-        .set_body_string(body)
+    ResponseTemplate::new(200).set_body_raw(body.as_bytes().to_vec(), "application/json")
 }
 
 /// A captured response, as if a proxy had sent it.

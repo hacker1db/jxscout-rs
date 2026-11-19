@@ -7,7 +7,7 @@ use base64::Engine as _;
 use common::*;
 use jxscout::ingest::IngestSource;
 use jxscout::ingest::har::HarSource;
-use jxscout::ingest::server::ServerSource;
+use jxscout::ingest::server::{ServerConfig, ServerSource};
 use jxscout::ingest::urls::UrlListSource;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -20,7 +20,7 @@ async fn start_server(p: jxscout::Pipeline, token: Option<&str>) -> (String, Can
     let shutdown = CancellationToken::new();
     let src = ServerSource {
         listener,
-        token: token.map(String::from),
+        config: ServerConfig::loopback(addr, "localhost", token.map(String::from)),
         shutdown: shutdown.clone(),
     };
     tokio::spawn(src.run(p));
@@ -206,4 +206,60 @@ async fn har_source_imports_entries() {
     p.wait_idle().await;
     assert_eq!(report.submitted, 1);
     assert!(read(&p, "h.test/app.js").is_some());
+}
+
+/// Security review #3: DNS-rebinding and cross-site POST defenses, checked
+/// before the body is read.
+#[tokio::test]
+async fn host_and_content_type_are_enforced_before_the_body() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = pipeline(offline_config(tmp.path()));
+    let (base, shutdown) = start_server(p.clone(), Some("tok")).await;
+    let port = base.rsplit(':').next().unwrap();
+    let client = reqwest::Client::new();
+    let body = caido_payload("https://a.test/1.js", "a()");
+
+    // A rebinding page sends its own hostname in Host.
+    let rebound = client
+        .post(format!("{base}/ingest"))
+        .header("host", format!("evil.test:{port}"))
+        .bearer_auth("tok")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rebound.status(), 403);
+
+    // A "simple" cross-site form/text POST.
+    let text = client
+        .post(format!("{base}/ingest"))
+        .bearer_auth("tok")
+        .header("content-type", "text/plain")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(text.status(), 415);
+
+    // Unauthorized + malformed: 401, not a JSON parse error.
+    let junk = client
+        .post(format!("{base}/ingest"))
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(junk.status(), 401);
+
+    // `localhost:<port>` is accepted.
+    let ok = client
+        .post(format!("{base}/ingest"))
+        .header("host", format!("localhost:{port}"))
+        .bearer_auth("tok")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 202);
+    shutdown.cancel();
 }

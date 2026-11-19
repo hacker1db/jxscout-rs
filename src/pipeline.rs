@@ -80,6 +80,9 @@ fn bump(a: &AtomicUsize, n: usize) {
     a.fetch_add(n, Ordering::Relaxed);
 }
 
+/// Max queued + in-progress items before [`Pipeline::submit`] refuses.
+pub const MAX_PENDING: usize = 20_000;
+
 /// Cheap-to-clone handle to the pipeline.
 #[derive(Clone)]
 pub struct Pipeline {
@@ -96,6 +99,8 @@ struct Inner {
     /// URLs already handled this session (derived items only).
     seen: Mutex<HashSet<String>>,
     tracker: TaskTracker,
+    /// Items submitted but not finished (bounded admission).
+    pending: Arc<AtomicUsize>,
     /// Bounds CPU-heavy parse/analyze work.
     cpu: Semaphore,
     stats: Stats,
@@ -134,6 +139,7 @@ impl Pipeline {
                 events,
                 seen: Mutex::new(HashSet::new()),
                 tracker: TaskTracker::new(),
+                pending: Arc::new(AtomicUsize::new(0)),
                 cpu: Semaphore::new(cpus),
                 stats: Stats::default(),
             }),
@@ -156,15 +162,42 @@ impl Pipeline {
         self.inner.stats.snapshot()
     }
 
-    /// Queue an item; returns immediately.
-    pub fn submit(&self, item: Captured) {
+    /// Queue an item; returns immediately. Returns `false` (and drops the
+    /// item) when [`MAX_PENDING`] items are already queued, so a flood of
+    /// ingest requests or a huge chunk fan-out can't exhaust memory.
+    pub fn submit(&self, item: Captured) -> bool {
+        let pending = Arc::clone(&self.inner.pending);
+        if pending.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING {
+            pending.fetch_sub(1, Ordering::AcqRel);
+            tracing::warn!(url = %item.request.url, "pipeline overloaded, dropping item");
+            return false;
+        }
         let this = self.clone();
-        self.inner
-            .tracker
-            .spawn(async move { this.process(item).await });
+        self.inner.tracker.spawn(async move {
+            this.process(item).await;
+            pending.fetch_sub(1, Ordering::AcqRel);
+        });
+        true
+    }
+
+    /// Like [`submit`](Self::submit) but waits for queue space instead of
+    /// dropping: backpressure for file-based sources.
+    pub async fn submit_wait(&self, item: Captured) {
+        while self.inner.pending.load(Ordering::Acquire) >= MAX_PENDING {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        self.submit(item);
+    }
+
+    /// Items queued or in progress.
+    pub fn pending(&self) -> usize {
+        self.inner.pending.load(Ordering::Acquire)
     }
 
     /// Wait until every submitted item and everything it spawned is done.
+    ///
+    /// Meant for a single owner (the CLI command or a test) between
+    /// batches; concurrent callers could reopen the tracker early.
     pub async fn wait_idle(&self) {
         self.inner.tracker.close();
         self.inner.tracker.wait().await;
@@ -174,9 +207,14 @@ impl Pipeline {
     /// Process one item to completion (children are spawned, not awaited).
     pub async fn process(&self, item: Captured) {
         let url = item.request.url.clone();
+        let derived = !item.origin.is_captured();
         if let Err(e) = self.process_inner(item).await {
             bump(&self.inner.stats.errors, 1);
             tracing::warn!(%url, "processing failed: {e:#}");
+            // Release the claim so a later discovery can retry this URL.
+            if derived {
+                self.unmark_seen(&url);
+            }
         }
     }
 
@@ -184,6 +222,11 @@ impl Pipeline {
     fn mark_seen(&self, url: &Url) -> bool {
         let mut seen = self.inner.seen.lock().unwrap_or_else(|e| e.into_inner());
         seen.insert(url.as_str().to_string())
+    }
+
+    fn unmark_seen(&self, url: &Url) {
+        let mut seen = self.inner.seen.lock().unwrap_or_else(|e| e.into_inner());
+        seen.remove(url.as_str());
     }
 
     async fn process_inner(&self, item: Captured) -> anyhow::Result<()> {
@@ -212,6 +255,12 @@ impl Pipeline {
         if !item.origin.is_captured() && !self.mark_seen(&url) {
             return Ok(());
         }
+        // Chunk names are content-hashed: one we stored in an earlier run
+        // doesn't need downloading again (R-35).
+        if item.origin == Origin::Chunk && inner.db.asset_hash(url.as_str())?.is_some() {
+            tracing::debug!(%url, "chunk already stored, skipping download");
+            return Ok(());
+        }
 
         // Credentials ride along from the first captured request (R-60).
         let auth = item.auth.clone().or_else(|| {
@@ -225,8 +274,10 @@ impl Pipeline {
             })
         });
 
-        let response = match item.response {
-            Some(r) => r,
+        // `final_url` is where the bytes really came from (after redirects);
+        // relative references resolve against it. `url` stays the DB key.
+        let (response, final_url) = match item.response {
+            Some(r) => (r, url.clone()),
             None => {
                 let purpose = match item.origin {
                     Origin::Referred => Purpose::Referred,
@@ -241,11 +292,14 @@ impl Pipeline {
                     .get(&url, &ctx)
                     .await
                     .with_context(|| format!("fetching {url}"))?;
-                CapturedResponse {
-                    status: r.status,
-                    headers: r.headers,
-                    body: r.body,
-                }
+                (
+                    CapturedResponse {
+                        status: r.status,
+                        headers: r.headers,
+                        body: r.body,
+                    },
+                    r.url,
+                )
             }
         };
 
@@ -256,6 +310,7 @@ impl Pipeline {
 
         let ctx = ItemCtx {
             url: &url,
+            base: &final_url,
             origin: item.origin,
             depth: item.depth,
             parent: item.parent.as_ref(),
@@ -275,7 +330,7 @@ impl Pipeline {
                 let text = String::from_utf8_lossy(&response.body).into_owned();
                 let asset = JsAsset {
                     db_url: url.to_string(),
-                    base: url.clone(),
+                    base: final_url.clone(),
                     rel_path: paths::asset_path(&url, AssetKind::Js),
                     text,
                     headers: response.headers.clone(),
@@ -294,9 +349,10 @@ impl Pipeline {
         let inner = &self.inner;
         let text = String::from_utf8_lossy(&resp.body).into_owned();
         let rel = paths::asset_path(cx.url, AssetKind::Html);
-        self.save(cx, AssetKind::Html, &rel, text.as_bytes())?;
+        self.save(cx, AssetKind::Html, &rel, text.as_bytes())
+            .await?;
 
-        let scripts = html::extract(cx.url, &text);
+        let scripts = html::extract(cx.base, &text);
         for script in scripts.external {
             inner.db.add_relation(cx.url.as_str(), script.as_str())?;
             self.spawn_child(script, Origin::Referred, cx);
@@ -304,7 +360,7 @@ impl Pipeline {
         for (i, body) in scripts.inline.into_iter().enumerate() {
             let asset = JsAsset {
                 db_url: format!("{}#inline-{}", cx.url, i + 1),
-                base: cx.url.clone(),
+                base: cx.base.clone(),
                 rel_path: paths::inline_script_path(cx.url, i + 1),
                 text: body,
                 headers: Headers::new(),
@@ -320,22 +376,22 @@ impl Pipeline {
     fn spawn_child(&self, url: Url, origin: Origin, cx: &ItemCtx<'_>) {
         let mut child = Captured::url_only(url, origin);
         child.depth = cx.depth + 1;
-        child.parent = Some(cx.url.clone());
+        child.parent = Some(cx.base.clone());
         child.auth = cx.auth.cloned();
         self.submit(child);
     }
 
-    fn save(
+    async fn save(
         &self,
         cx: &ItemCtx<'_>,
         kind: AssetKind,
         rel: &Path,
         bytes: &[u8],
     ) -> anyhow::Result<PathBuf> {
-        self.save_as(cx.url.as_str(), cx, kind, rel, bytes)
+        self.save_as(cx.url.as_str(), cx, kind, rel, bytes).await
     }
 
-    fn save_as(
+    async fn save_as(
         &self,
         db_url: &str,
         cx: &ItemCtx<'_>,
@@ -344,10 +400,15 @@ impl Pipeline {
         bytes: &[u8],
     ) -> anyhow::Result<PathBuf> {
         let inner = &self.inner;
-        let used = inner
-            .store
-            .write(rel, bytes)
-            .with_context(|| format!("saving {db_url} to {}", rel.display()))?;
+        // File I/O is blocking: keep it off the async worker threads.
+        let used = {
+            let store = inner.store.clone();
+            let (rel, data) = (rel.to_path_buf(), bytes.to_vec());
+            tokio::task::spawn_blocking(move || store.write(&rel, &data))
+                .await
+                .map_err(|e| anyhow::anyhow!("write task failed: {e}"))?
+        }
+        .with_context(|| format!("saving {db_url} to {}", rel.display()))?;
         inner.db.upsert_asset(&AssetRow {
             url: db_url.to_string(),
             kind,
@@ -403,7 +464,8 @@ impl Pipeline {
             AssetKind::Js,
             &asset.rel_path,
             content.as_bytes(),
-        )?;
+        )
+        .await?;
         inner.db.upsert_asset_hash(&asset.db_url, &hash)?;
 
         if inner.cfg.discovery.analyze {
@@ -545,7 +607,10 @@ impl Pipeline {
 
 /// Per-item context passed down the handlers.
 struct ItemCtx<'a> {
+    /// The requested URL (database key, file path).
     url: &'a Url,
+    /// The final URL after redirects (base for relative references).
+    base: &'a Url,
     origin: Origin,
     depth: u32,
     parent: Option<&'a Url>,

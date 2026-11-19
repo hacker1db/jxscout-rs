@@ -87,7 +87,10 @@ impl SecretsRule {
             // Skip obvious non-secrets like `token: "Bearer"` or a path.
             && !v.starts_with('/')
             && v.chars().any(|c| c.is_ascii_digit());
-        if plausible && SECRET_NAME_RE.is_match(name) {
+        // A value that matches a known token format is already reported by
+        // the pattern pass on the string literal itself.
+        let known_format = PATTERNS.iter().any(|(_, re)| re.is_match(&v));
+        if plausible && !known_format && SECRET_NAME_RE.is_match(name) {
             cx.report(
                 span,
                 "Data/Secrets/generic-assignment",
@@ -157,6 +160,17 @@ mod tests {
             "AIzaFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE123"
         ));
         assert!(f.iter().any(|(c, _)| c == "Data/Secrets/private-key"));
+    }
+
+    /// Codex M3 #11: one finding, not two, for a known token in a
+    /// secret-named variable.
+    #[test]
+    fn known_token_not_double_reported() {
+        let f = run(
+            SecretsRule::default(),
+            r#"const apiKey = "AKIAIOSFODNN7EXAMPLE";"#,
+        );
+        assert_eq!(f.len(), 1, "{f:?}");
     }
 
     #[test]
