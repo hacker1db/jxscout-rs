@@ -48,7 +48,14 @@ R-11. **(design)** Ingest payload: `POST /ingest` with a JSON body
 }
 ```
 
-`headers` values may be a string or an array of strings. Exactly one of `body`
+`headers` values may be a string or an array of strings.
+
+R-11b. **(design)** `body` / `body_base64` carry the response body **as sent on
+the wire**, with the original response headers. If `Content-Encoding` is
+`gzip`, `x-gzip`, `deflate`, or `br`, the server decodes it with the download
+cap applied to the decoded size and every decoded byte charged to the memory
+budget (zip-bomb safe); other encodings are rejected. HAR `content.text` is
+already decoded, so the HAR importer drops `Content-Encoding`. Exactly one of `body`
 or `body_base64` may be set; both absent means "no body" (the tool may fetch the
 URL itself). `GET /health` returns `200 ok`. A batch form (`POST /ingest/batch`,
 JSON array, at most 1000 entries) is accepted. Request bodies are capped
@@ -129,11 +136,17 @@ component. Writes refuse to follow symlinks inside the output tree. Collision
 handling is deterministic (same inputs → same path). **(design, security)**
 
 R-34. Reversed source-map sources are written under
-`<project>/<host>/(sourcemaps)/…`, prefixed by host to avoid clashes between
-sites. `[REL-0.9.2]`
+`<project>/<host>/(sourcemaps)/<bundle path>/…`, prefixed by host to avoid
+clashes between sites `[REL-0.9.2]` and by the bundle they came from so two
+bundles' `src/index.ts` don't collide **(design)**. Inline scripts are saved
+next to their page as `<page file>.inline-N.js`. Path components changed by
+sanitizing get a short hash of the original name, so distinct names never
+merge **(design)**.
 
 R-35. All ingested assets are tracked in a local database (SQLite) so restarts
-don't re-download the same files; relationships "HTML page loads JS" and "JS
+don't re-process the same files (an unchanged script is skipped only when its
+chunk and source-map discovery completed without retryable failures; otherwise
+discovery runs again, e.g. after logging in); relationships "HTML page loads JS" and "JS
 loaded by pages" are recorded. `[REL-0.5]`, `[README]` (`loads`, `loaded`,
 `assets`, `truncate-tables`).
 

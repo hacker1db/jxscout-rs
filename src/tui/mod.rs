@@ -15,14 +15,15 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 
 use crate::pipeline::Pipeline;
+use crate::store::Db;
 use app::{Action, App, AssetItem, HeaderInfo};
 
 /// (Re)load the asset list, keeping the same asset selected by URL so a
 /// reordered snapshot can't silently switch the findings pane to another
 /// asset.
-fn load_assets(pipeline: &Pipeline, app: &mut App) {
+fn load_assets(db: &Db, app: &mut App) {
     let selected_url = app.selected_asset().map(|a| a.url.clone());
-    match pipeline.db().assets_with_counts(10_000) {
+    match db.assets_with_counts(10_000) {
         Ok(rows) => {
             app.assets = rows
                 .into_iter()
@@ -37,13 +38,23 @@ fn load_assets(pipeline: &Pipeline, app: &mut App) {
     app.select_url(selected_url.as_deref());
 }
 
-fn reload_findings(pipeline: &Pipeline, app: &mut App) {
+fn reload_findings(db: &Db, app: &mut App) {
     let url = app.selected_asset().map(|a| a.url.clone());
     let findings = match url {
-        Some(u) => pipeline.db().findings(Some(&u), None).unwrap_or_default(),
+        Some(u) => db.findings(Some(&u), None).unwrap_or_default(),
         None => Vec::new(),
     };
     app.set_findings(findings);
+}
+
+/// Build the TUI state exactly as `run` does at startup (assets with
+/// counts, first asset selected, its findings loaded). Public so tests can
+/// check the TUI shows the same data as `findings --json`.
+pub fn snapshot(db: &Db, header: HeaderInfo) -> App {
+    let mut app = App::new(header);
+    load_assets(db, &mut app);
+    reload_findings(db, &mut app);
+    app
 }
 
 /// Run the TUI until the user quits or `shutdown` fires. The terminal is
@@ -56,8 +67,8 @@ pub async fn run(
     let mut app = App::new(header);
     // Subscribe before loading so no event falls in the gap.
     let mut events = pipeline.events().subscribe();
-    load_assets(&pipeline, &mut app);
-    reload_findings(&pipeline, &mut app);
+    load_assets(pipeline.db(), &mut app);
+    reload_findings(pipeline.db(), &mut app);
 
     let mut terminal = ratatui::init();
     let mut keys = EventStream::new();
@@ -71,7 +82,7 @@ pub async fn run(
                     Some(Ok(TermEvent::Key(k))) if k.kind == KeyEventKind::Press => {
                         match app.on_key(k) {
                             Action::Quit => break,
-                            Action::ReloadFindings => reload_findings(&pipeline, &mut app),
+                            Action::ReloadFindings => reload_findings(pipeline.db(), &mut app),
                             Action::None => {}
                         }
                     }
@@ -80,11 +91,11 @@ pub async fn run(
                     None => break,
                 },
                 ev = events.recv() => match ev {
-                    Ok(ev) => if app.on_event(ev) { reload_findings(&pipeline, &mut app) },
+                    Ok(ev) => if app.on_event(ev) { reload_findings(pipeline.db(), &mut app) },
                     // We fell behind a burst of events: resync from the DB.
                     Err(RecvError::Lagged(_)) => {
-                        load_assets(&pipeline, &mut app);
-                        reload_findings(&pipeline, &mut app);
+                        load_assets(pipeline.db(), &mut app);
+                        reload_findings(pipeline.db(), &mut app);
                     }
                     Err(RecvError::Closed) => break,
                 },

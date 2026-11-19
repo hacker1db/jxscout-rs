@@ -64,7 +64,8 @@ fn headers(h: Vec<HarHeader>) -> Headers {
 
 /// Convert one entry. Entries without a body become "fetch it yourself".
 pub fn entry_to_captured(e: HarEntry) -> Result<Captured, String> {
-    let url = Url::parse(&e.request.url).map_err(|err| format!("`{}`: {err}", e.request.url))?;
+    let url = Url::parse(&e.request.url)
+        .map_err(|err| format!("`{}`: {err}", crate::text::clean(&e.request.url)))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!("`{url}`: unsupported scheme"));
     }
@@ -88,13 +89,25 @@ pub fn entry_to_captured(e: HarEntry) -> Result<Captured, String> {
         },
         response: body.map(|body| CapturedResponse {
             status: e.response.status,
-            headers: headers(e.response.headers),
+            // HAR `content.text` is already decoded (HAR 1.2 §content), so
+            // the wire `Content-Encoding` no longer applies to it.
+            headers: Headers(
+                headers(e.response.headers)
+                    .0
+                    .into_iter()
+                    .filter(|(k, _)| {
+                        !k.eq_ignore_ascii_case("content-encoding")
+                            && !k.eq_ignore_ascii_case("content-length")
+                    })
+                    .collect(),
+            ),
             body,
         }),
         origin: Origin::Har,
         depth: 0,
         parent: None,
         auth: None,
+        owner: None,
     })
 }
 
@@ -121,8 +134,12 @@ impl IngestSource for HarSource {
         for entry in self.har.log.entries {
             match entry_to_captured(entry) {
                 Ok(c) => {
-                    pipeline.submit_wait(c).await;
-                    report.submitted += 1;
+                    // Count what was actually admitted, not what was read.
+                    if pipeline.submit_wait(c).await {
+                        report.submitted += 1;
+                    } else {
+                        report.rejected += 1;
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("skipping HAR entry {e}");

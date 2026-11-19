@@ -17,14 +17,14 @@ use tracing_subscriber::{EnvFilter, Layer as _};
 
 use jxscout::config::{Config, DiscoveryConfig, FetchConfig, ForwardAuth};
 use jxscout::events::{EventBus, LogLayer};
-use jxscout::ingest::IngestSource as _;
 use jxscout::ingest::har::HarSource;
 use jxscout::ingest::server::{ServerConfig, ServerSource, check_bind_addr};
 use jxscout::ingest::urls::UrlListSource;
+use jxscout::ingest::{IngestReport, IngestSource as _};
 use jxscout::rules::{self, Registry};
 use jxscout::scope::Scope;
 use jxscout::store::{Db, validate_project_name};
-use jxscout::text::clean;
+use jxscout::text::{SafeMakeWriter, clean};
 use jxscout::{Pipeline, tui};
 
 #[derive(Parser, Debug)]
@@ -98,6 +98,9 @@ struct GlobalArgs {
     /// Numeric chunk ids tried when no chunk table is found.
     #[arg(long, default_value_t = 3000, global = true)]
     bruteforce_limit: u32,
+    /// Max scripts taken from one HTML page (external and inline each).
+    #[arg(long, default_value_t = 500, global = true)]
+    max_scripts_per_page: usize,
     /// Memory budget in MiB for response bodies held at once.
     #[arg(long, default_value_t = 512, global = true)]
     memory_budget_mb: usize,
@@ -141,6 +144,9 @@ enum Command {
     /// Import a HAR file, then exit.
     IngestHar {
         file: PathBuf,
+        /// Refuse HAR files larger than this (MiB); HARs are parsed in memory.
+        #[arg(long, default_value_t = 256)]
+        max_har_mb: u64,
         /// Print the summary as JSON.
         #[arg(long)]
         json: bool,
@@ -262,6 +268,7 @@ fn build_config(g: &GlobalArgs) -> anyhow::Result<Config> {
             sourcemaps: !g.no_sourcemaps,
             analyze: !g.no_analyze,
             memory_budget: g.memory_budget_mb.max(1) * 1024 * 1024,
+            max_scripts_per_page: g.max_scripts_per_page,
             ..DiscoveryConfig::default()
         },
     })
@@ -274,9 +281,7 @@ fn init_logging(
     to_stderr: bool,
     bus: Option<&EventBus>,
 ) -> anyhow::Result<PathBuf> {
-    let dir = cfg.output_dir.join(".jxscout-rs");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("jxscout.log");
+    let path = jxscout::store::meta_file(&cfg.output_dir, "jxscout.log")?;
     // Simple size cap: start fresh when the log passes 10 MiB.
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > 10 * 1024 * 1024) {
         let _ = std::fs::remove_file(&path);
@@ -292,13 +297,16 @@ fn init_logging(
     };
     let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
 
+    // Both outputs go through `SafeWriter`, which escapes control and bidi
+    // characters from untrusted values (ANSI colors are off for that reason).
     let file_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
-        .with_writer(std::sync::Mutex::new(file))
+        .with_writer(SafeMakeWriter(std::sync::Mutex::new(file)))
         .with_filter(filter());
     let stderr_layer = to_stderr.then(|| {
         tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_writer(SafeMakeWriter(std::io::stderr))
             .with_target(false)
             .compact()
             .with_filter(filter())
@@ -312,11 +320,20 @@ fn init_logging(
     Ok(path)
 }
 
-fn print_stats(p: &Pipeline, json: bool) -> anyhow::Result<()> {
+fn print_stats(p: &Pipeline, report: IngestReport, json: bool) -> anyhow::Result<()> {
     let s = p.stats();
     if json {
-        println!("{}", serde_json::to_string_pretty(&s)?);
+        let out = serde_json::json!({
+            "submitted": report.submitted,
+            "rejected": report.rejected,
+            "stats": s,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
+        println!(
+            "submitted {} · rejected {}",
+            report.submitted, report.rejected
+        );
         println!(
             "received {} · out of scope {} · saved {} · unchanged {} · findings {} · chunks {} · source maps {} · errors {}",
             s.received,
@@ -375,6 +392,7 @@ async fn serve(cfg: Config, args: ServeArgs, debug: bool) -> anyhow::Result<()> 
         ServerConfig {
             token: token.clone(),
             allowed_hosts: None,
+            ..ServerConfig::default()
         }
     } else {
         ServerConfig::loopback(local, &args.hostname, token.clone())
@@ -423,34 +441,23 @@ async fn serve(cfg: Config, args: ServeArgs, debug: bool) -> anyhow::Result<()> 
         }
         shutdown.cancelled().await;
     }
-    server_task.await??;
+    // Bounded drain: in-flight requests get a few seconds, then we stop
+    // waiting (body reads have their own deadline too).
+    match tokio::time::timeout(Duration::from_secs(5), server_task).await {
+        Ok(joined) => {
+            joined??;
+        }
+        Err(_) => tracing::warn!("ingest server did not drain within 5 s; exiting anyway"),
+    };
     // Give in-flight work a moment to finish writing.
     let _ = tokio::time::timeout(Duration::from_secs(2), pipeline.wait_idle()).await;
     Ok(())
 }
 
-/// Read the persisted ingest token, or create one (mode 0600 on Unix).
+/// Read the persisted ingest token, or create one (O_EXCL, mode 0600).
 fn load_or_create_token(output_dir: &Path) -> anyhow::Result<String> {
-    let path = output_dir.join(".jxscout-rs").join("ingest-token");
-    if let Ok(t) = std::fs::read_to_string(&path) {
-        let t = t.trim().to_string();
-        if !t.is_empty() {
-            return Ok(t);
-        }
-    }
-    let token = jxscout::ingest::server::generate_token();
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    use std::io::Write as _;
-    opts.open(&path)
-        .and_then(|mut f| f.write_all(token.as_bytes()))
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(token)
+    jxscout::store::load_or_create_token(output_dir, jxscout::ingest::server::generate_token)
+        .context("loading the ingest token")
 }
 
 fn open_db(cfg: &Config) -> anyhow::Result<Db> {
@@ -521,10 +528,24 @@ async fn main() -> anyhow::Result<()> {
                 "url list read"
             );
             pipeline.wait_idle().await;
-            print_stats(&pipeline, json)?;
+            print_stats(&pipeline, report, json)?;
         }
-        Command::IngestHar { file, json } => {
+        Command::IngestHar {
+            file,
+            max_har_mb,
+            json,
+        } => {
             init_logging(&cfg, debug, true, None)?;
+            let size = std::fs::metadata(&file)
+                .with_context(|| format!("reading {}", file.display()))?
+                .len();
+            if size > max_har_mb * 1024 * 1024 {
+                bail!(
+                    "{} is {} MiB, larger than --max-har-mb {max_har_mb}",
+                    file.display(),
+                    size / (1024 * 1024)
+                );
+            }
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("reading {}", file.display()))?;
             let source = HarSource::parse(&text).context("parsing HAR")?;
@@ -536,7 +557,7 @@ async fn main() -> anyhow::Result<()> {
                 "HAR read"
             );
             pipeline.wait_idle().await;
-            print_stats(&pipeline, json)?;
+            print_stats(&pipeline, report, json)?;
         }
         Command::Assets {
             search,

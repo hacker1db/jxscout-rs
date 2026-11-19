@@ -24,9 +24,10 @@ pub fn parse_line(line: &str) -> Result<Option<Url>, String> {
     if line.is_empty() || line.starts_with('#') {
         return Ok(None);
     }
-    let url = Url::parse(line).map_err(|e| format!("`{line}`: {e}"))?;
+    let shown = crate::text::clean(line);
+    let url = Url::parse(line).map_err(|e| format!("`{shown}`: {e}"))?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(format!("`{line}`: only http(s) URLs are supported"));
+        return Err(format!("`{shown}`: only http(s) URLs are supported"));
     }
     Ok(Some(url))
 }
@@ -42,10 +43,14 @@ impl<R: AsyncRead + Unpin + Send> IngestSource for UrlListSource<R> {
         while let Some(line) = lines.next_line().await? {
             match parse_line(&line) {
                 Ok(Some(url)) => {
-                    pipeline
+                    if pipeline
                         .submit_wait(Captured::url_only(url, Origin::UrlList))
-                        .await;
-                    report.submitted += 1;
+                        .await
+                    {
+                        report.submitted += 1;
+                    } else {
+                        report.rejected += 1;
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => {

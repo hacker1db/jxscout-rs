@@ -72,6 +72,7 @@ pub fn captured(
         depth: 0,
         parent: None,
         auth: None,
+        owner: None,
     }
 }
 

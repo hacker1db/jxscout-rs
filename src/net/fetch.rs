@@ -44,6 +44,11 @@ pub struct FetchContext<'a> {
     pub parent: Option<&'a Url>,
     /// Credentials captured with the original request.
     pub auth: Option<&'a AuthContext>,
+    /// Wait for memory-budget room before reading the body (default).
+    /// Callers that already hold a reservation must set this to `false`:
+    /// they get [`FetchError::OverBudget`] instead of waiting (see the
+    /// deadlock rule in `budget.rs`).
+    pub wait_for_budget: bool,
 }
 
 impl<'a> FetchContext<'a> {
@@ -52,7 +57,13 @@ impl<'a> FetchContext<'a> {
             purpose,
             parent: None,
             auth: None,
+            wait_for_budget: true,
         }
+    }
+
+    pub fn without_budget_wait(mut self) -> Self {
+        self.wait_for_budget = false;
+        self
     }
 
     pub fn with_parent(mut self, parent: Option<&'a Url>) -> Self {
@@ -326,7 +337,9 @@ impl Fetcher {
                     .map_err(|_| FetchError::BadRedirect(loc.to_string()))?;
                 continue;
             }
-            let mut r = self.read_response(current, resp).await?;
+            let mut r = self
+                .read_response(current, resp, ctx.wait_for_budget)
+                .await?;
             r.stayed_on_origin = send_credentials;
             return Ok(r);
         }
@@ -337,6 +350,7 @@ impl Fetcher {
         &self,
         url: Url,
         mut resp: reqwest::Response,
+        wait_for_budget: bool,
     ) -> Result<FetchResponse, FetchError> {
         let limit = self.inner.cfg.max_body_bytes;
         // Cheap early exit when the server announces a huge body. We still
@@ -374,7 +388,10 @@ impl Fetcher {
             .unwrap_or(UNKNOWN_LENGTH_START as u64)
             .min(limit) as usize;
         let memory = match &self.inner.budget {
-            Some(b) => Some(b.reserve(reserve).await.ok_or(FetchError::OverBudget)?),
+            Some(b) if wait_for_budget => {
+                Some(b.reserve(reserve).await.ok_or(FetchError::OverBudget)?)
+            }
+            Some(b) => Some(b.try_reserve(reserve).ok_or(FetchError::OverBudget)?),
             None => None,
         };
         let initial = reserve.min(UNKNOWN_LENGTH_START);

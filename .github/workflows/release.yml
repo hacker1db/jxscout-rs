@@ -14,8 +14,35 @@ env:
   BIN: jxscout-rs
 
 jobs:
+  # Fail fast on a malformed tag or a tag that doesn't match Cargo.toml.
+  validate:
+    name: validate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: v
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [[ "$REF_TYPE" == "tag" ]]; then
+            if [[ ! "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::tag '$REF_NAME' is not vMAJOR.MINOR.PATCH"; exit 1
+            fi
+            if [[ "${REF_NAME#v}" != "$version" ]]; then
+              echo "::error::tag $REF_NAME does not match Cargo.toml version $version"; exit 1
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   build:
     name: build (${{ matrix.target }})
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -69,7 +96,7 @@ jobs:
       - name: Smoke test (native targets only)
         if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-musl'
         shell: bash
-        run: ./.github/smoke-test.sh "target/${{ matrix.target }}/release/${BIN}"
+        run: ./.github/smoke-test.sh "target/${{ matrix.target }}/release/${BIN}" "${{ needs.validate.outputs.version }}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.pkg.outputs.name }}
@@ -81,7 +108,7 @@ jobs:
   # Run the cross-compiled arm64 musl binary on a real arm64 runner.
   smoke-arm64:
     name: smoke (aarch64-unknown-linux-musl)
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -95,7 +122,29 @@ jobs:
       - name: Smoke test
         run: |
           tar -xzf artifacts/*.tar.gz -C artifacts
-          ./.github/smoke-test.sh artifacts/*/jxscout-rs
+          ./.github/smoke-test.sh artifacts/*/jxscout-rs "${{ needs.validate.outputs.version }}"
+
+  # Run the Intel macOS binary under Rosetta 2 on an Apple Silicon runner.
+  smoke-macos-x86_64:
+    name: smoke (x86_64-apple-darwin, Rosetta)
+    needs: [validate, build]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "*-x86_64-apple-darwin"
+          path: artifacts
+          merge-multiple: true
+      - name: Smoke test
+        run: |
+          /usr/bin/pgrep -q oahd || softwareupdate --install-rosetta --agree-to-license
+          tar -xzf artifacts/*.tar.gz -C artifacts
+          bin="$(ls artifacts/*/jxscout-rs)"
+          file "$bin" | grep -q x86_64
+          arch -x86_64 ./.github/smoke-test.sh "$bin" "${{ needs.validate.outputs.version }}"
 
   caido-plugin:
     name: Caido plugin
@@ -134,7 +183,7 @@ jobs:
     name: publish GitHub release
     # Only a real tag push publishes; a manual run against a tag stays a dry run.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [build, caido-plugin, smoke-arm64]
+    needs: [build, caido-plugin, smoke-arm64, smoke-macos-x86_64]
     runs-on: ubuntu-latest
     permissions:
       contents: write

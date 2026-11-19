@@ -39,14 +39,30 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Max items per batch (R-11).
 pub const MAX_BATCH: usize = 1000;
 
+/// Time allowed to receive a whole request body. A client that stalls
+/// mid-body would otherwise hold one of the body permits forever.
+pub const DEFAULT_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Access rules for the endpoint.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Required bearer token; `None` disables auth (`--no-auth`).
     pub token: Option<String>,
     /// Accepted `Host` header values (lower-case, with port). `None`
     /// accepts any host (only with `--allow-remote-ingest`).
     pub allowed_hosts: Option<Vec<String>>,
+    /// Deadline for reading a request body (`408` after it).
+    pub body_timeout: std::time::Duration,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            token: None,
+            allowed_hosts: None,
+            body_timeout: DEFAULT_BODY_TIMEOUT,
+        }
+    }
 }
 
 impl ServerConfig {
@@ -69,6 +85,7 @@ impl ServerConfig {
         Self {
             token,
             allowed_hosts: Some(hosts),
+            body_timeout: DEFAULT_BODY_TIMEOUT,
         }
     }
 }
@@ -141,11 +158,36 @@ async fn guard(State(state): State<AppState>, req: Request<Body>, next: Next) ->
                 "Content-Type must be application/json",
             );
         }
-        // Held while the handler reads and decodes the body.
+        // Held while the body is read and decoded by the handler.
         let Ok(_permit) = state.bodies.clone().acquire_owned().await else {
             return error(StatusCode::SERVICE_UNAVAILABLE, "shutting down");
         };
-        return next.run(req).await;
+        // Read the whole body under a deadline (and the size cap), so a
+        // stalled client can't hold the permit forever.
+        let (parts, body) = req.into_parts();
+        let bytes = match tokio::time::timeout(
+            state.cfg.body_timeout,
+            axum::body::to_bytes(body, MAX_BODY_BYTES),
+        )
+        .await
+        {
+            Ok(Ok(b)) => b,
+            Ok(Err(_)) => {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "body too large or unreadable",
+                );
+            }
+            Err(_) => {
+                return error(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request body not received in time",
+                );
+            }
+        };
+        return next
+            .run(Request::from_parts(parts, Body::from(bytes)))
+            .await;
     }
     next.run(req).await
 }

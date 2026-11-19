@@ -51,7 +51,7 @@ async fn html_to_scripts_to_chunks_to_sourcemaps() {
     let stats = p.stats();
     assert_eq!(stats.errors, 0, "{stats:?}");
     assert!(read(&p, &format!("{host}/(index).html")).is_some());
-    assert!(read(&p, &format!("{host}/(inline-1).js")).is_some());
+    assert!(read(&p, &format!("{host}/(index).html.inline-1.js")).is_some());
     // beautified
     let main = read(&p, &format!("{host}/static/js/main.js")).unwrap();
     assert!(main.lines().count() > 5);
@@ -59,7 +59,11 @@ async fn html_to_scripts_to_chunks_to_sourcemaps() {
     assert!(read(&p, &format!("{host}/static/js/101.aaaa1111.chunk.js")).is_some());
     assert!(read(&p, &format!("{host}/static/js/202.bbbb2222.chunk.js")).is_some());
     // source map reversed
-    let app = read(&p, &format!("{host}/(sourcemaps)/demo/src/api.js")).unwrap();
+    let app = read(
+        &p,
+        &format!("{host}/(sourcemaps)/static/js/main.js/demo/src/api.js"),
+    )
+    .unwrap();
     assert!(app.contains("/api/v1/admin"));
 
     // relations + findings

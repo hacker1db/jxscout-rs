@@ -15,7 +15,7 @@
 //! file never stops the pipeline. Work fans out as tokio tasks tracked by a
 //! [`TaskTracker`], so `ingest-urls` can wait for the whole tree to finish.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,7 +31,7 @@ use crate::config::Config;
 use crate::events::{AssetKind, Event, EventBus};
 use crate::js::{self, chunks, html, sourcemap};
 use crate::model::{AuthContext, Captured, CapturedResponse, Headers, Origin};
-use crate::net::{FetchContext, Fetcher, Purpose};
+use crate::net::{FetchContext, Fetcher, Purpose, decode};
 use crate::rules::{self, Finding, Registry};
 use crate::store::{AssetRow, AssetStore, Db, paths};
 
@@ -93,10 +93,9 @@ pub const DEFAULT_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
 enum Work {
     /// A captured or discovered request/response.
     Item(Captured),
-    /// A source-map lookup for one script (remote candidates).
+    /// The source-map lookup for one script: every candidate (remote and
+    /// inline) in priority order, stopping at the first that validates.
     Map(MapJob),
-    /// An inline (`data:`) source map, already decoded.
-    InlineMap(InlineMapJob),
 }
 
 impl Work {
@@ -104,8 +103,7 @@ impl Work {
     fn bytes(&self) -> usize {
         match self {
             Work::Item(item) => body_len(item),
-            Work::Map(_) => 0,
-            Work::InlineMap(j) => j.bytes.len(),
+            Work::Map(j) => j.inline_bytes(),
         }
     }
 
@@ -113,7 +111,6 @@ impl Work {
         match self {
             Work::Item(item) => item.request.url.to_string(),
             Work::Map(j) => format!("source map for {}", j.js_url),
-            Work::InlineMap(j) => format!("inline source map for {}", j.js_url),
         }
     }
 }
@@ -149,6 +146,8 @@ struct Inner {
     events: EventBus,
     /// URLs already handled this session (derived items only).
     seen: Mutex<HashSet<String>>,
+    /// Outstanding discovery work per owning script (see [`Track`]).
+    discovery: Mutex<HashMap<String, Track>>,
     tracker: TaskTracker,
     /// Work items queued or running (bounded admission).
     items: Arc<AtomicUsize>,
@@ -162,7 +161,9 @@ struct Inner {
 /// Where the SQLite database for a project lives: next to, not inside, the
 /// project folder so it doesn't clutter the tree you open in your editor.
 pub fn db_path(output_dir: &Path, project: &str) -> PathBuf {
-    output_dir.join(".jxscout-rs").join(format!("{project}.db"))
+    output_dir
+        .join(crate::store::META_DIR)
+        .join(format!("{project}.db"))
 }
 
 impl Pipeline {
@@ -173,8 +174,8 @@ impl Pipeline {
     pub fn with_rules(cfg: Config, events: EventBus, rules: Registry) -> anyhow::Result<Self> {
         let store = AssetStore::new(&cfg.output_dir, &cfg.project)
             .with_context(|| format!("creating project dir in {}", cfg.output_dir.display()))?;
-        let db_file = db_path(&cfg.output_dir, &cfg.project);
-        std::fs::create_dir_all(db_file.parent().expect("db path has a parent"))?;
+        let db_file = crate::store::meta_file(&cfg.output_dir, &format!("{}.db", cfg.project))
+            .context("checking the metadata directory")?;
         let db = Db::open(&db_file).with_context(|| format!("opening {}", db_file.display()))?;
         let budget = Budget::new(cfg.discovery.memory_budget);
         let fetcher = Fetcher::with_budget(
@@ -193,6 +194,7 @@ impl Pipeline {
                 rules,
                 events,
                 seen: Mutex::new(HashSet::new()),
+                discovery: Mutex::new(HashMap::new()),
                 tracker: TaskTracker::new(),
                 items: Arc::new(AtomicUsize::new(0)),
                 budget,
@@ -237,19 +239,19 @@ impl Pipeline {
     /// Like [`admit`](Self::admit) but waits for room (backpressure for
     /// file-based sources). Called only from ingest sources, which hold no
     /// reservation, so waiting can't deadlock.
-    async fn admit_wait(&self, work: Work) {
+    async fn admit_wait(&self, work: Work) -> bool {
         let bytes = work.bytes();
         if bytes > self.inner.budget.capacity() {
             tracing::warn!(
                 "{} is larger than the memory budget, dropping",
                 crate::text::clean(&work.describe())
             );
-            return;
+            return false;
         }
         loop {
             if let Some(guard) = self.try_guard(bytes) {
                 self.spawn_work(work, guard);
-                return;
+                return true;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -284,8 +286,11 @@ impl Pipeline {
             let _guard = guard; // released when the work finishes
             match work {
                 Work::Item(item) => this.process(item).await,
-                Work::Map(job) => this.find_sourcemap(job).await,
-                Work::InlineMap(job) => this.inline_sourcemap(job).await,
+                Work::Map(job) => {
+                    let owner = job.db_url.clone();
+                    let ok = this.find_sourcemap(job).await;
+                    this.track_done(&owner, ok);
+                }
             }
         });
     }
@@ -297,8 +302,10 @@ impl Pipeline {
     }
 
     /// Queue an item, waiting for capacity instead of dropping it.
-    pub async fn submit_wait(&self, item: Captured) {
-        self.admit_wait(Work::Item(item)).await;
+    /// Returns `false` only if the item can never fit (body larger than the
+    /// whole memory budget).
+    pub async fn submit_wait(&self, item: Captured) -> bool {
+        self.admit_wait(Work::Item(item)).await
     }
 
     /// Work items queued or in progress.
@@ -330,13 +337,81 @@ impl Pipeline {
     pub async fn process(&self, item: Captured) {
         let url = item.request.url.clone();
         let derived = !item.origin.is_captured();
-        if let Err(e) = self.process_inner(item).await {
-            bump(&self.inner.stats.errors, 1);
-            tracing::warn!(%url, "processing failed: {e:#}");
-            // Release the claim so a later discovery can retry this URL.
-            if derived {
-                self.unmark_seen(&url);
+        let owner = item.owner.clone();
+        let ok = match self.process_inner(item).await {
+            Ok(ok) => ok,
+            Err(e) => {
+                bump(&self.inner.stats.errors, 1);
+                tracing::warn!(%url, "processing failed: {e:#}");
+                false
             }
+        };
+        // A failed derived item releases its claim so a later discovery
+        // (e.g. after logging in) can fetch it again.
+        if !ok && derived {
+            self.unmark_seen(&url);
+        }
+        if let Some(owner) = owner {
+            self.track_done(&owner, ok);
+        }
+    }
+
+    // --- discovery completion tracking -------------------------------
+    //
+    // A script's discovery is "complete" only when every chunk and its
+    // source-map lookup finished without a retryable failure. Until then
+    // re-ingesting the unchanged script runs discovery again (R-35).
+
+    fn tracks(&self) -> std::sync::MutexGuard<'_, HashMap<String, Track>> {
+        self.inner
+            .discovery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Start tracking `owner`, holding one token for the owner itself.
+    fn track_begin(&self, owner: &str) {
+        self.tracks().insert(
+            owner.to_string(),
+            Track {
+                pending: 1,
+                failed: false,
+            },
+        );
+        if let Err(e) = self.inner.db.set_discovery_complete(owner, false) {
+            tracing::warn!("recording discovery state: {e}");
+        }
+    }
+
+    /// Schedule `work` on behalf of `owner`; a refused admission counts as
+    /// a retryable failure.
+    fn admit_tracked(&self, owner: &str, work: Work) {
+        if let Some(t) = self.tracks().get_mut(owner) {
+            t.pending += 1;
+        }
+        if !self.admit(work) {
+            self.track_done(owner, false);
+        }
+    }
+
+    fn track_done(&self, owner: &str, ok: bool) {
+        let finished = {
+            let mut tracks = self.tracks();
+            let Some(t) = tracks.get_mut(owner) else {
+                return;
+            };
+            t.failed |= !ok;
+            t.pending = t.pending.saturating_sub(1);
+            if t.pending == 0 {
+                tracks.remove(owner).map(|t| !t.failed)
+            } else {
+                None
+            }
+        };
+        if let Some(complete) = finished
+            && let Err(e) = self.inner.db.set_discovery_complete(owner, complete)
+        {
+            tracing::warn!("recording discovery state: {e}");
         }
     }
 
@@ -351,7 +426,10 @@ impl Pipeline {
         seen.remove(url.as_str());
     }
 
-    async fn process_inner(&self, item: Captured) -> anyhow::Result<()> {
+    /// Returns `Ok(true)` when the item succeeded or there is nothing to
+    /// retry, `Ok(false)` for retryable failures (non-2xx, a login page
+    /// instead of JS, budget refusals).
+    async fn process_inner(&self, item: Captured) -> anyhow::Result<bool> {
         let inner = &self.inner;
         bump(&inner.stats.received, 1);
         let url = item.request.url.clone();
@@ -363,29 +441,29 @@ impl Pipeline {
                 // R-24 / upstream #9: say *which* request and *why*.
                 tracing::debug!(
                     %url,
-                    host = url.host_str().unwrap_or_default(),
-                    origin = item.origin.as_str(),
+                    host = %url.host_str().unwrap_or_default(),
+                    origin = %item.origin.as_str(),
                     "request is not in scope: {decision}"
                 );
-                return Ok(());
+                return Ok(true);
             }
         }
         if item.depth > inner.cfg.discovery.max_depth {
             tracing::debug!(%url, depth = item.depth, "max discovery depth reached");
-            return Ok(());
+            return Ok(true);
         }
         if !item.origin.is_captured() && !self.mark_seen(&url) {
-            return Ok(());
+            return Ok(true);
         }
         // Chunk names are content-hashed: one we stored in an earlier run
         // doesn't need downloading again (R-35).
         if item.origin == Origin::Chunk && inner.db.asset_hash(url.as_str())?.is_some() {
             tracing::debug!(%url, "chunk already stored, skipping download");
-            return Ok(());
+            return Ok(true);
         }
 
         // Credentials ride along from the first captured request (R-60).
-        let auth = item.auth.clone().or_else(|| {
+        let mut auth = item.auth.clone().or_else(|| {
             let h = item
                 .request
                 .headers
@@ -396,12 +474,11 @@ impl Pipeline {
             })
         });
 
+        // Reservations covering bodies held by this item, kept until done.
+        let mut _memory: Vec<Reservation> = Vec::new();
         // `final_url` is where the bytes really came from (after redirects);
         // relative references resolve against it. `url` stays the DB key.
-        let mut auth = auth;
-        // The fetched body's reservation, held until this item is done.
-        let mut _fetched_memory: Option<Reservation> = None;
-        let (response, final_url) = match item.response {
+        let (mut response, final_url) = match item.response {
             Some(r) => (r, url.clone()),
             None => {
                 let purpose = match item.origin {
@@ -417,7 +494,7 @@ impl Pipeline {
                     .get(&url, &ctx)
                     .await
                     .with_context(|| format!("fetching {url}"))?;
-                _fetched_memory = r.memory;
+                _memory.extend(r.memory);
                 // Credential eligibility doesn't come back after leaving the
                 // origin, even if the chain returned to it (R-61).
                 if !r.stayed_on_origin {
@@ -436,11 +513,40 @@ impl Pipeline {
 
         if !(200..300).contains(&response.status) {
             tracing::debug!(%url, status = response.status, "skipping non-2xx response");
-            // Let a later discovery retry it (e.g. after a 503 or 401).
-            if !item.origin.is_captured() {
-                self.unmark_seen(&url);
+            return Ok(false);
+        }
+
+        // Captured bodies arrive as they were on the wire (R-11b): undo
+        // Content-Encoding with a capped, budget-charged decoder. The
+        // fetcher's own downloads are decoded (and capped) while streaming.
+        if response.headers.get("content-encoding").is_some() {
+            match decode::decode_captured(
+                &response.headers,
+                &response.body,
+                inner.cfg.fetch.max_body_bytes as usize,
+                &inner.budget,
+            ) {
+                Ok(Some((body, reservation, headers))) => {
+                    response.body = body;
+                    response.headers = headers;
+                    _memory.push(reservation);
+                }
+                Ok(None) => {}
+                // Some tools hand over an already-decoded body but keep the
+                // original header; a body that isn't valid compressed data
+                // is taken as-is (it's no bigger than what was admitted).
+                Err(decode::DecodeError::Corrupt(enc)) => {
+                    tracing::debug!(%url, "body is not valid {enc}; treating it as already decoded");
+                    response
+                        .headers
+                        .0
+                        .retain(|(k, _)| !k.eq_ignore_ascii_case("content-encoding"));
+                }
+                Err(e) => {
+                    tracing::warn!(%url, "could not decode captured body: {e}");
+                    return Ok(false);
+                }
             }
-            return Ok(());
         }
 
         let ctx = ItemCtx {
@@ -454,13 +560,15 @@ impl Pipeline {
         match classify(&url, &response.headers, &response.body) {
             Some(AssetKind::Html) if matches!(item.origin, Origin::Chunk | Origin::Referred) => {
                 // Asked for JS, got HTML: almost always a login redirect
-                // (upstream #31). Don't save it as JS.
+                // (upstream #31). Don't save it as JS, and let a later,
+                // authenticated discovery try again.
                 tracing::warn!(
                     %url,
                     "expected JavaScript but got HTML (auth required? check cookies / --forward-auth)"
                 );
+                return Ok(false);
             }
-            Some(AssetKind::Html) => self.handle_html(&ctx, &response).await?,
+            Some(AssetKind::Html) => self.handle_html(&ctx, response).await?,
             Some(AssetKind::Js) => {
                 let text = String::from_utf8_lossy(&response.body).into_owned();
                 let asset = JsAsset {
@@ -468,7 +576,7 @@ impl Pipeline {
                     base: final_url.clone(),
                     rel_path: paths::asset_path(&url, AssetKind::Js),
                     text,
-                    headers: response.headers.clone(),
+                    headers: response.headers,
                     find_sourcemaps: true,
                 };
                 self.handle_js(&ctx, asset).await?;
@@ -477,20 +585,40 @@ impl Pipeline {
                 tracing::debug!(%url, content_type = ?response.headers.content_type(), "ignoring non HTML/JS asset");
             }
         }
-        Ok(())
+        Ok(true)
     }
 
-    async fn handle_html(&self, cx: &ItemCtx<'_>, resp: &CapturedResponse) -> anyhow::Result<()> {
+    async fn handle_html(&self, cx: &ItemCtx<'_>, resp: CapturedResponse) -> anyhow::Result<()> {
         let inner = &self.inner;
-        let text = String::from_utf8_lossy(&resp.body).into_owned();
         let rel = paths::asset_path(cx.url, AssetKind::Html);
+        // Parsing HTML is CPU work on untrusted input: bounded and off the
+        // async workers, like JS parsing.
+        let (text, scripts) = {
+            let _permit = inner.cpu.acquire().await.expect("semaphore never closed");
+            let base = cx.base.clone();
+            let max = inner.cfg.discovery.max_scripts_per_page;
+            tokio::task::spawn_blocking(move || {
+                let text = String::from_utf8_lossy(&resp.body).into_owned();
+                let scripts = html::extract(&base, &text, max);
+                (text, scripts)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("HTML parsing task panicked: {e}"))?
+        };
         self.save(cx, AssetKind::Html, &rel, text.as_bytes())
             .await?;
+        drop(text);
+        if scripts.truncated {
+            tracing::info!(
+                url = %cx.url,
+                "page has more than {} scripts; extra ones were ignored (--max-scripts-per-page)",
+                inner.cfg.discovery.max_scripts_per_page
+            );
+        }
 
-        let scripts = html::extract(cx.base, &text);
         for script in scripts.external {
             inner.db.add_relation(cx.url.as_str(), script.as_str())?;
-            self.spawn_child(script, Origin::Referred, cx);
+            self.spawn_child(script, Origin::Referred, cx, None);
         }
         for (i, body) in scripts.inline.into_iter().enumerate() {
             let asset = JsAsset {
@@ -508,7 +636,9 @@ impl Pipeline {
         Ok(())
     }
 
-    fn spawn_child(&self, url: Url, origin: Origin, cx: &ItemCtx<'_>) {
+    /// Schedule a discovered URL. `owner` is the script whose discovery
+    /// this belongs to (tracked for completion), if any.
+    fn spawn_child(&self, url: Url, origin: Origin, cx: &ItemCtx<'_>, owner: Option<&str>) {
         let mut child = Captured::url_only(url, origin);
         child.depth = cx.depth + 1;
         // The parent used for scope / same-origin exemptions is the URL we
@@ -521,8 +651,16 @@ impl Pipeline {
         } else {
             None
         };
-        if !self.admit(Work::Item(child)) {
-            tracing::debug!("child not scheduled (pipeline at capacity)");
+        match owner {
+            Some(owner) => {
+                child.owner = Some(owner.to_string());
+                self.admit_tracked(owner, Work::Item(child));
+            }
+            None => {
+                if !self.admit(Work::Item(child)) {
+                    tracing::debug!("child not scheduled (pipeline at capacity)");
+                }
+            }
         }
     }
 
@@ -575,12 +713,19 @@ impl Pipeline {
 
     async fn handle_js(&self, cx: &ItemCtx<'_>, asset: JsAsset) -> anyhow::Result<()> {
         let inner = &self.inner;
-        // R-35: skip unchanged files we already processed in an earlier run.
+        // R-35: skip files we already processed in an earlier run, unless
+        // their discovery didn't complete (a chunk or map failed, e.g.
+        // before logging in): then run it again.
         let hash = sha256_hex(asset.text.as_bytes());
-        if inner.db.asset_hash(&asset.db_url)?.as_deref() == Some(hash.as_str()) {
-            bump(&inner.stats.unchanged, 1);
-            tracing::debug!(url = %asset.db_url, "unchanged since last run, skipping");
-            return Ok(());
+        if let Some((stored, complete)) = inner.db.asset_state(&asset.db_url)?
+            && stored == hash
+        {
+            if complete {
+                bump(&inner.stats.unchanged, 1);
+                tracing::debug!(url = %asset.db_url, "unchanged since last run, skipping");
+                return Ok(());
+            }
+            tracing::debug!(url = %asset.db_url, "unchanged, but discovery was incomplete: retrying");
         }
 
         // Parsing is CPU-bound: run it on the blocking pool, bounded by a
@@ -612,6 +757,9 @@ impl Pipeline {
         )
         .await?;
         inner.db.upsert_asset_hash(&asset.db_url, &hash)?;
+        // From here on, children report back to this owner token.
+        let owner = asset.db_url.clone();
+        self.track_begin(&owner);
 
         if inner.cfg.discovery.analyze {
             inner
@@ -637,43 +785,33 @@ impl Pipeline {
                 count: n,
             });
             for chunk in analysis.chunks.urls {
-                self.spawn_child(chunk, Origin::Chunk, cx);
+                self.spawn_child(chunk, Origin::Chunk, cx, Some(&owner));
             }
         }
 
         if inner.cfg.discovery.sourcemaps && asset.find_sourcemaps {
-            // Runs as its own task so the map download doesn't wait for
-            // memory while this item still holds its script's share (the
-            // budget semaphore is FIFO-fair, so that could deadlock).
-            let mut remote = Vec::new();
-            for candidate in sourcemap::candidates(&asset.base, &asset.headers, &asset.text) {
-                match candidate {
-                    sourcemap::Candidate::Remote { url, why } => remote.push((url, why)),
-                    // Inline maps are their own work item so their bytes are
-                    // charged to the budget like any other body.
-                    sourcemap::Candidate::Inline { bytes } => {
-                        self.admit(Work::InlineMap(InlineMapJob {
-                            js_url: asset.base.clone(),
-                            db_url: asset.db_url.clone(),
-                            bytes,
-                        }));
-                    }
-                }
-            }
-            if !remote.is_empty() {
-                self.admit(Work::Map(MapJob {
-                    remote,
+            // One job per script with every candidate in priority order
+            // (R-71); it stops at the first that validates. Inline map
+            // bytes are charged to the budget at admission.
+            let candidates = sourcemap::candidates(&asset.base, &asset.headers, &asset.text);
+            if !candidates.is_empty() {
+                let job = MapJob {
+                    candidates,
                     js_url: asset.base.clone(),
-                    db_url: asset.db_url.clone(),
+                    db_url: owner.clone(),
                     parent: cx.url.clone(),
                     // Same rule as for chunks: credentials don't follow a
                     // cross-origin redirect.
                     auth: (cx.base.origin() == cx.url.origin())
                         .then(|| cx.auth.cloned())
                         .flatten(),
-                }));
+                };
+                self.admit_tracked(&owner, Work::Map(job));
             }
         }
+        // Release the owner's own token; completion is recorded once every
+        // child has reported back.
+        self.track_done(&owner, true);
         Ok(())
     }
 
@@ -713,43 +851,64 @@ impl Pipeline {
         out
     }
 
-    /// Try remote candidates in priority order; the first that validates
-    /// wins (R-71). Each download is charged to the budget by the fetcher
-    /// before its body is read, and released before the next attempt.
-    async fn find_sourcemap(&self, job: MapJob) {
+    /// Try every candidate in priority order; the first that validates
+    /// wins (R-71). Returns `true` if a map was found, or if every
+    /// candidate failed definitively (404, not a map), so there's nothing
+    /// to retry; `false` if something might work next time (network error,
+    /// auth or server error, a login page, no budget).
+    async fn find_sourcemap(&self, job: MapJob) -> bool {
         let inner = &self.inner;
-        for (url, why) in &job.remote {
-            // The trusted parent is the requested script URL.
-            let ctx = FetchContext::new(Purpose::SourceMap)
-                .with_parent(Some(&job.parent))
-                .with_auth(job.auth.as_ref());
-            let r = match inner.fetcher.get(url, &ctx).await {
-                Ok(r) if r.is_success() => r,
-                Ok(r) => {
-                    tracing::debug!(%url, status = r.status, why, "source map candidate rejected");
-                    continue;
+        // While this job holds inline-map bytes it must not wait for more
+        // budget (deadlock rule in `budget.rs`).
+        let holds_memory = job.inline_bytes() > 0;
+        let mut retryable = false;
+        for candidate in &job.candidates {
+            match candidate {
+                sourcemap::Candidate::Inline { bytes } => {
+                    let map_url = format!("{}#inline-map", job.js_url);
+                    if self
+                        .apply_sourcemap(&job.js_url, &job.db_url, &map_url, bytes)
+                        .await
+                    {
+                        return true;
+                    }
                 }
-                Err(e) => {
-                    tracing::debug!(%url, why, "source map candidate failed: {e}");
-                    continue;
+                sourcemap::Candidate::Remote { url, why } => {
+                    // The trusted parent is the requested script URL.
+                    let mut ctx = FetchContext::new(Purpose::SourceMap)
+                        .with_parent(Some(&job.parent))
+                        .with_auth(job.auth.as_ref());
+                    if holds_memory {
+                        ctx = ctx.without_budget_wait();
+                    }
+                    let r = match inner.fetcher.get(url, &ctx).await {
+                        Ok(r) if r.is_success() => r,
+                        Ok(r) => {
+                            tracing::debug!(%url, status = r.status, why, "source map candidate rejected");
+                            retryable |= !matches!(r.status, 404 | 410);
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::debug!(%url, why, "source map candidate failed: {e}");
+                            retryable |= !matches!(e, crate::net::FetchError::Blocked(_));
+                            continue;
+                        }
+                    };
+                    // `r.memory` covers `r.body` until `r` is dropped.
+                    if self
+                        .apply_sourcemap(&job.js_url, &job.db_url, url.as_str(), &r.body)
+                        .await
+                    {
+                        return true;
+                    }
+                    // A 200 HTML page instead of a map is usually a login
+                    // page: worth retrying once authenticated.
+                    retryable |= classify(url, &r.headers, &r.body) == Some(AssetKind::Html);
                 }
-            };
-            // `r.memory` covers `r.body` until `r` is dropped.
-            if self
-                .apply_sourcemap(&job.js_url, &job.db_url, url.as_str(), &r.body)
-                .await
-            {
-                return;
             }
         }
         tracing::debug!(js = %job.js_url, "no source map found");
-    }
-
-    /// An inline `data:` map; its bytes were charged at admission.
-    async fn inline_sourcemap(&self, job: InlineMapJob) {
-        let map_url = format!("{}#inline-map", job.js_url);
-        self.apply_sourcemap(&job.js_url, &job.db_url, &map_url, &job.bytes)
-            .await;
+        !retryable
     }
 
     /// Validate and reverse one map. Returns `true` on success.
@@ -798,7 +957,10 @@ impl Pipeline {
                 };
                 match store.write(&rel, src.content.as_bytes()) {
                     Ok(_) => written += 1,
-                    Err(e) => tracing::warn!(source = %src.name, "could not write source: {e}"),
+                    Err(e) => tracing::warn!(
+                        source = %crate::text::clean(&src.name),
+                        "could not write source: {e}"
+                    ),
                 }
             }
             written
@@ -810,24 +972,39 @@ impl Pipeline {
     }
 }
 
-/// An inline source map, run as its own work item.
-struct InlineMapJob {
-    js_url: Url,
-    db_url: String,
-    bytes: Vec<u8>,
+/// Outstanding discovery work for one script.
+struct Track {
+    /// Children not yet finished, plus one token held by the owner while it
+    /// is still scheduling them.
+    pending: usize,
+    /// Any child failed in a retryable way.
+    failed: bool,
 }
 
-/// A remote source-map lookup, run as its own work item (see `handle_js`).
+/// The source-map lookup for one script, run as its own work item.
 struct MapJob {
-    /// Remote candidates in priority order, with why each was suggested.
-    remote: Vec<(Url, &'static str)>,
+    /// Every candidate in priority order (R-71).
+    candidates: Vec<sourcemap::Candidate>,
     /// URL the map references resolve against (final URL of the script).
     js_url: Url,
-    /// Database key of the script.
+    /// Database key of the script (also its discovery owner).
     db_url: String,
     /// Trusted parent for scope decisions: the requested script URL.
     parent: Url,
     auth: Option<AuthContext>,
+}
+
+impl MapJob {
+    /// Bytes of decoded inline maps this job carries.
+    fn inline_bytes(&self) -> usize {
+        self.candidates
+            .iter()
+            .map(|c| match c {
+                sourcemap::Candidate::Inline { bytes } => bytes.len(),
+                sourcemap::Candidate::Remote { .. } => 0,
+            })
+            .sum()
+    }
 }
 
 /// Per-item context passed down the handlers.

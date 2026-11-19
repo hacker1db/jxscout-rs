@@ -56,6 +56,50 @@ fn is_unsafe(c: char) -> bool {
     c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
+/// An `io::Write` adapter that escapes control and bidi characters in
+/// everything written through it, keeping only `\n` and `\t`. Used for the
+/// stderr and log-file tracing outputs, as a backstop for any untrusted
+/// value that reaches a log line without going through [`clean`].
+pub struct SafeWriter<W>(pub W);
+
+impl<W: std::io::Write> std::io::Write for SafeWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
+        let mut out = String::with_capacity(text.len());
+        for c in text.chars() {
+            if (c.is_control() && c != '\n' && c != '\t') || is_unsafe_bidi(c) {
+                out.extend(c.escape_unicode());
+            } else {
+                out.push(c);
+            }
+        }
+        self.0.write_all(out.as_bytes())?;
+        // Report the input as fully consumed.
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+fn is_unsafe_bidi(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// `tracing_subscriber` writer factory wrapping another one in [`SafeWriter`].
+pub struct SafeMakeWriter<M>(pub M);
+
+impl<'a, M: tracing_subscriber::fmt::MakeWriter<'a>> tracing_subscriber::fmt::MakeWriter<'a>
+    for SafeMakeWriter<M>
+{
+    type Writer = SafeWriter<M::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SafeWriter(self.0.make_writer())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +113,19 @@ mod tests {
         assert_eq!(c, "x\\u{1b}]0;pwned\\u{7}\\u{1b}[2Jy\\u{a}");
         assert!(!clean("a\u{202E}b").contains('\u{202E}'));
         assert_eq!(Clean("a\x1bb").to_string(), "a\\u{1b}b");
+    }
+
+    /// Independent review #11: log output escapes CR, ESC, and bidi.
+    #[test]
+    fn safe_writer_escapes_log_injection() {
+        use std::io::Write as _;
+        let mut w = SafeWriter(Vec::new());
+        write!(w, "url=https://a.test/x\r\x1b[31mFAKE\u{202E}evil\n").unwrap();
+        let out = String::from_utf8(w.0).unwrap();
+        assert_eq!(
+            out,
+            "url=https://a.test/x\\u{d}\\u{1b}[31mFAKE\\u{202e}evil\n"
+        );
     }
 
     #[test]

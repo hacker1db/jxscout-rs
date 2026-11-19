@@ -95,6 +95,8 @@ pub struct DiscoveryConfig {
     pub max_chunks_per_script: usize,
     /// Max sources written from one source map (R-36).
     pub max_sourcemap_sources: usize,
+    /// Max external (and, separately, inline) scripts taken from one page.
+    pub max_scripts_per_page: usize,
     pub chunks: bool,
     pub sourcemaps: bool,
     pub analyze: bool,
@@ -110,6 +112,7 @@ impl Default for DiscoveryConfig {
             max_depth: 3,
             max_chunks_per_script: 4000,
             max_sourcemap_sources: 10_000,
+            max_scripts_per_page: 500,
             chunks: true,
             sourcemaps: true,
             analyze: true,

@@ -342,4 +342,45 @@ mod tests {
         assert!(app.help_scroll < u16::MAX);
         assert!(end.contains("(sourcemaps)"), "last line visible:\n{end}");
     }
+
+    /// Independent review (#18 gap): keyboard scrolling keeps the selected
+    /// findings row visible in a short viewport.
+    #[test]
+    fn findings_scroll_keeps_selection_visible() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        let mut app = app_with_data();
+        app.set_findings(
+            (0..60)
+                .map(|i| FindingRow {
+                    asset_url: "u".into(),
+                    rule_id: "strings".into(),
+                    category: "Data/Paths/API".into(),
+                    value: format!("/api/v1/item-{i:02}"),
+                    line: i + 1,
+                    column: 1,
+                })
+                .collect(),
+        );
+        app.on_key(key(KeyCode::Tab)); // focus findings
+        app.on_key(key(KeyCode::End));
+        let screen = render(&mut app, 40, 12);
+        assert!(screen.contains("item-59"), "last row visible:\n{screen}");
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::PageUp));
+        }
+        let screen = render(&mut app, 40, 12);
+        assert!(
+            screen.contains("item-29"),
+            "row 29 visible after paging:\n{screen}"
+        );
+        app.on_key(key(KeyCode::Home));
+        let screen = render(&mut app, 40, 12);
+        assert!(screen.contains("item-00"), "{screen}");
+    }
 }

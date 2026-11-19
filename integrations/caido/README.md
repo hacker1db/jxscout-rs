@@ -25,3 +25,8 @@ endpoints with credentials in the URL. It skips responses over 40 MiB. Caido's
 backend `fetch` doesn't let plugins control redirects, so point
 `JXSCOUT_ENDPOINT` at the jxscout-rs server directly, not at something that
 redirects.
+
+Bodies are forwarded as captured, with the original response headers. If
+the response was compressed (`Content-Encoding: gzip`/`br`/`deflate`),
+jxscout-rs decodes it on its side (capped, so compression bombs are refused);
+a body that's already decoded is accepted as-is.

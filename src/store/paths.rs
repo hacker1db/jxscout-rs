@@ -52,10 +52,34 @@ pub fn sanitize_component(raw: &str) -> Option<String> {
     if RESERVED.contains(&stem.as_str()) {
         s.insert(0, '_');
     }
+    // Lossy sanitizing would make distinct names collide (`a:b` and `a_b`
+    // both become `a_b`), so a changed name gets a short hash of the
+    // original. Untouched names stay readable.
+    if s != raw {
+        s = with_hash_suffix(&s, raw);
+    }
     if s.len() > MAX_COMPONENT {
         s = truncate_with_hash(&s);
     }
     Some(s)
+}
+
+fn short_hash(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(s.as_bytes())
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `name.ext` → `name~hash.ext`, hashing `original`.
+fn with_hash_suffix(name: &str, original: &str) -> String {
+    let hash = short_hash(original);
+    match name.rfind('.').filter(|&i| i > 0 && name.len() - i <= 10) {
+        Some(i) => format!("{}~{hash}{}", &name[..i], &name[i..]),
+        None => format!("{name}~{hash}"),
+    }
 }
 
 /// Shorten a long name while keeping it unique and keeping its extension.
@@ -143,16 +167,31 @@ pub fn asset_path(url: &Url, kind: AssetKind) -> PathBuf {
     path
 }
 
-/// Path for the `n`-th inline `<script>` of an HTML page: next to the page's
-/// `(index).html`.
+/// Path for the `n`-th inline `<script>` of an HTML page, next to the page
+/// and named after it (`page.html.inline-1.js`, `(index).html.inline-1.js`),
+/// so two pages in one directory never share an inline script file. A
+/// query string makes a different page: it gets a hash in the name.
 pub fn inline_script_path(page_url: &Url, n: usize) -> PathBuf {
     let mut p = asset_path(page_url, AssetKind::Html);
-    p.set_file_name(format!("(inline-{n}).js"));
+    let page_file = p
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let query = page_url
+        .query()
+        .map(|q| format!("~{}", short_hash(q)))
+        .unwrap_or_default();
+    let name = sanitize_component(&format!("{page_file}{query}.inline-{n}.js"))
+        .unwrap_or_else(|| format!("inline-{n}.js"));
+    p.set_file_name(name);
     p
 }
 
 /// Path for a reversed source-map source (R-34):
-/// `<host>/(sourcemaps)/<cleaned source path>`.
+/// `<host>/(sourcemaps)/<bundle path>/<cleaned source path>`.
+///
+/// Sources are namespaced by the bundle they came from, so two bundles on
+/// one host that both contain `src/index.ts` don't overwrite each other.
 ///
 /// Source names look like `webpack://app/./src/App.tsx`,
 /// `webpack:///node_modules/x/index.js`, `../../src/a.ts`, or even
@@ -179,6 +218,17 @@ pub fn sourcemap_source_path(js_url: &Url, source: &str) -> Option<PathBuf> {
     }
     let mut p = PathBuf::from(host_dir(js_url));
     p.push(SOURCEMAPS_DIR);
+    let mut bundle = decoded_segments(js_url);
+    if bundle.is_empty() {
+        bundle.push("(index).js".into());
+    }
+    if let Some(q) = js_url.query() {
+        // `main.js?v=1` and `main.js?v=2` may be different bundles.
+        if let Some(last) = bundle.last_mut() {
+            *last = format!("{last}~{}", short_hash(q));
+        }
+    }
+    p.extend(bundle);
     p.extend(comps);
     Some(p)
 }
@@ -253,11 +303,11 @@ mod tests {
         let js = u("https://app.test/static/main.js");
         assert_eq!(
             sourcemap_source_path(&js, "webpack://app/./src/App.tsx").unwrap(),
-            PathBuf::from("app.test/(sourcemaps)/app/src/App.tsx")
+            PathBuf::from("app.test/(sourcemaps)/static/main.js/app/src/App.tsx")
         );
         assert_eq!(
             sourcemap_source_path(&js, "webpack:///node_modules/x/i.js").unwrap(),
-            PathBuf::from("app.test/(sourcemaps)/node_modules/x/i.js")
+            PathBuf::from("app.test/(sourcemaps)/static/main.js/node_modules/x/i.js")
         );
         for hostile in [
             "../../../../etc/passwd",
@@ -267,15 +317,48 @@ mod tests {
         ] {
             let p = sourcemap_source_path(&js, hostile).unwrap();
             assert!(is_safe(&p), "{hostile} -> {p:?}");
-            assert!(p.starts_with("app.test/(sourcemaps)"), "{hostile} -> {p:?}");
+            assert!(
+                p.starts_with("app.test/(sourcemaps)/static/main.js"),
+                "{hostile} -> {p:?}"
+            );
         }
         assert!(sourcemap_source_path(&js, "../..").is_none());
     }
 
+    /// Independent review #3: inline scripts of different pages and sources
+    /// of different bundles never share a path.
+    #[test]
+    fn inline_and_sourcemap_namespacing() {
+        let a = inline_script_path(&u("https://h.test/docs/a.html"), 1);
+        let b = inline_script_path(&u("https://h.test/docs/b.html"), 1);
+        let root = inline_script_path(&u("https://h.test/docs/"), 1);
+        let q1 = inline_script_path(&u("https://h.test/docs/a.html?x=1"), 1);
+        assert_eq!(a, PathBuf::from("h.test/docs/a.html.inline-1.js"));
+        assert_eq!(root, PathBuf::from("h.test/docs/(index).html.inline-1.js"));
+        assert_ne!(a, b);
+        assert_ne!(a, q1);
+
+        let m1 = sourcemap_source_path(&u("https://h.test/js/main.js"), "src/index.ts").unwrap();
+        let m2 = sourcemap_source_path(&u("https://h.test/js/admin.js"), "src/index.ts").unwrap();
+        let m3 =
+            sourcemap_source_path(&u("https://h.test/js/main.js?v=2"), "src/index.ts").unwrap();
+        assert_ne!(m1, m2);
+        assert_ne!(m1, m3);
+    }
+
     #[test]
     fn reserved_and_long_names() {
-        assert_eq!(sanitize_component("CON.js").unwrap(), "_CON.js");
-        assert_eq!(sanitize_component("a:b").unwrap(), "a_b");
+        assert!(sanitize_component("CON.js").unwrap().starts_with("_CON~"));
+        // Lossy sanitizing gets a hash, so distinct raw names stay distinct.
+        let a = sanitize_component("a:b").unwrap();
+        let b = sanitize_component("a_b").unwrap();
+        assert!(a.starts_with("a_b~"), "{a}");
+        assert_eq!(b, "a_b");
+        assert_ne!(a, b);
+        assert_eq!(
+            sanitize_component("plain-name.js").unwrap(),
+            "plain-name.js"
+        );
         let long = format!("{}.js", "x".repeat(500));
         let s = sanitize_component(&long).unwrap();
         assert!(s.len() <= MAX_COMPONENT && s.ends_with(".js"));

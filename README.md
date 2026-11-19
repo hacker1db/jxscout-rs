@@ -39,8 +39,9 @@ copied. If you want the original author's current product, see
   in [`integrations/caido`](integrations/caido)), `curl`, URL lists
   (file or stdin), and HAR files.
 - **Organized storage**: `~/jxscout/<project>/<host>/<path>`, with pages saved
-  as `(index).html`, inline scripts as `(inline-N).js`, and reversed sources
-  under `<host>/(sourcemaps)/`. A SQLite index tracks assets, page→script
+  as `(index).html`, inline scripts next to their page as
+  `<page>.inline-N.js`, and reversed sources under
+  `<host>/(sourcemaps)/<bundle path>/`. A SQLite index tracks assets, page→script
   relations, findings, and source maps across restarts.
 - **Beautifying** with the [oxc](https://oxc.rs) parser and code generator.
 - **Chunk discovery** for webpack (static evaluation of the runtime's
@@ -153,7 +154,10 @@ The full DTO (batches go to `/ingest/batch`, up to 1000 items):
 ```
 
 `headers` values may be a string or a list. Use `body_base64` instead of `body`
-for binary-safe transport. Leave out `response` (or its body) and jxscout-rs
+for binary-safe transport. Send the body **as it was on the wire**, together
+with the original headers: if `Content-Encoding` is `gzip`, `deflate`, or `br`,
+jxscout-rs decodes it (capped by `--max-download-mb` and the memory budget, so
+compression bombs are refused). Leave out `response` (or its body) and jxscout-rs
 fetches the URL itself.
 
 ### URL lists and HAR files

@@ -118,6 +118,10 @@ pub struct Captured {
     /// Auth headers from the *originally captured* request, carried down the
     /// discovery tree so chunks behind auth can be fetched (R-60, upstream #31).
     pub auth: Option<AuthContext>,
+    /// Database key of the script whose discovery produced this item. Used
+    /// to mark that script's discovery complete only when every child
+    /// succeeded, so failures are retried on the next ingest.
+    pub owner: Option<String>,
 }
 
 /// Credentials captured with a request and the origin they belong to.
@@ -142,6 +146,7 @@ impl Captured {
             depth: 0,
             parent: None,
             auth: None,
+            owner: None,
         }
     }
 }
@@ -222,8 +227,9 @@ pub enum PayloadError {
 impl IngestPayload {
     /// Validate and convert into a pipeline item.
     pub fn into_captured(self, origin: Origin) -> Result<Captured, PayloadError> {
-        let url =
-            Url::parse(&self.request.url).map_err(|_| PayloadError::BadUrl(self.request.url))?;
+        let url = Url::parse(&self.request.url).map_err(|_| {
+            PayloadError::BadUrl(crate::text::clean(&self.request.url).into_owned())
+        })?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err(PayloadError::BadScheme(url.scheme().to_string()));
         }
@@ -260,6 +266,7 @@ impl IngestPayload {
             depth: 0,
             parent: None,
             auth: None,
+            owner: None,
         })
     }
 }

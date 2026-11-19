@@ -34,6 +34,9 @@ async function forward(sdk: SDK, request: Request, response: Response): Promise<
     sdk.console.warn(`jxscout-rs: skipping ${request.getUrl()} (${rawBody.length} bytes > ${MAX_BODY_BYTES})`);
     return;
   }
+  // Ingest contract (docs/SPEC.md R-11b): send the body as it was on the
+  // wire together with the original headers; jxscout-rs undoes any
+  // Content-Encoding itself, with a size cap and memory budget.
   const body = rawBody?.toRaw() ?? new Uint8Array();
   const payload = buildPayload(
     request.getUrl(),

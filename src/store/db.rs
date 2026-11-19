@@ -24,7 +24,9 @@ CREATE TABLE IF NOT EXISTS assets (
     size       INTEGER NOT NULL,
     origin     TEXT NOT NULL,
     parent_url TEXT,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    -- 1 once chunk + source-map discovery for this asset fully succeeded
+    discovery_complete INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS relations (
     page_url   TEXT NOT NULL,
@@ -97,6 +99,15 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        // Databases created before `discovery_complete` existed.
+        let has_column = conn
+            .prepare("SELECT discovery_complete FROM assets LIMIT 0")
+            .is_ok();
+        if !has_column {
+            conn.execute_batch(
+                "ALTER TABLE assets ADD COLUMN discovery_complete INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -136,6 +147,27 @@ impl Db {
                 row.parent_url,
                 now()
             ],
+        )?;
+        Ok(())
+    }
+
+    /// `(content hash, discovery complete)` for `url`, if stored.
+    pub fn asset_state(&self, url: &str) -> rusqlite::Result<Option<(String, bool)>> {
+        self.conn()
+            .query_row(
+                "SELECT sha256, discovery_complete FROM assets WHERE url = ?1",
+                [url],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+    }
+
+    /// Record whether discovery for `url` finished without retryable
+    /// failures (R-35: unchanged assets are skipped only when complete).
+    pub fn set_discovery_complete(&self, url: &str, complete: bool) -> rusqlite::Result<()> {
+        self.conn().execute(
+            "UPDATE assets SET discovery_complete = ?2 WHERE url = ?1",
+            params![url, complete as i64],
         )?;
         Ok(())
     }
