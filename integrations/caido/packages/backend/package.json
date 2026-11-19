@@ -1,0 +1,15 @@
+{
+  "name": "jxscout-rs-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test src/payload.test.ts"
+  },
+  "devDependencies": {
+    "@caido/sdk-backend": "0.59.1",
+    "@types/node": "22.15.30"
+  }
+}

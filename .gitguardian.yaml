@@ -1,0 +1,10 @@
+# ggshield configuration (https://docs.gitguardian.com/ggshield-docs/reference/gitguardian-yaml)
+version: 2
+secret:
+  # Unit/integration tests for the secrets AST rule contain obviously fake,
+  # documented example values (e.g. AWS's AKIAIOSFODNN7EXAMPLE). They are
+  # not credentials.
+  ignored_paths:
+    - "src/rules/secrets.rs"
+    - "tests/**"
+    - "demo/fixtures/**"

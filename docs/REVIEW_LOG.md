@@ -64,3 +64,10 @@ Scoped to `src/rules`, `src/tui`, `src/js/chunks.rs`.
 | 2 | Med | IPv6 embedded-IPv4 forms (NAT64, 6to4, Teredo, compat) | Fixed: `embedded_v4` + Teredo/site-local blocked; table tests in `guard.rs` |
 | 3 | Med | Local ingest open to DNS rebinding / CSRF | Fixed: Host allow-list, random persisted token by default (`--no-auth` opt-out), JSON-only Content-Type, 64 MiB cap; Caido plugin sends the token; ingest tests |
 | 4 | Med | Terminal escape injection | Fixed: `text::clean` escapes control + bidi chars in CLI output, TUI, and log pane; unit test |
+
+## Security review, 2nd pass (security-guidance plugin, on `f3ebc69`)
+
+| # | Sev | Finding | Action |
+| --- | --- | --- | --- |
+| 1 | Med | Post-redirect base used as trusted parent: credential leak / scope bypass | Fixed: children and source-map fetches use the requested URL as parent; credentials dropped when the final origin differs; cross-origin `in-scope` forwarding mode removed entirely (R-61). Regression `redirect_target_is_not_a_trusted_parent` (verified failing on the old code) |
+| 2 | Med | `analyze` printed category unsanitized | Fixed: categories restricted to a safe alphabet at creation (`text::category`), verbs allow-listed, `Clean` Display wrapper added, all CLI prints sanitized; `tests/output_hygiene.rs` fails on any raw finding-field `println!` |

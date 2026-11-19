@@ -78,7 +78,7 @@ impl RuleContext<'_> {
         }
         self.findings.push(Finding {
             rule: self.rule,
-            category: category.into(),
+            category: crate::text::category(&category.into()),
             value,
             line,
             column,

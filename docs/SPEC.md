@@ -54,9 +54,15 @@ URL itself). `GET /health` returns `200 ok`. A batch form (`POST /ingest/batch`,
 JSON array, at most 1000 entries) is accepted. Request bodies are capped
 (default 64 MiB). `[#20]` asked for a documented "reference request or DTO".
 
-R-11a. **(design, security)** If `--ingest-token` (env `JXSCOUT_INGEST_TOKEN`)
-is set, every ingest request must carry `Authorization: Bearer <token>`, else
-`401`. Binding to a non-loopback address requires `--allow-remote-ingest`.
+R-11a. **(design, security)** Every ingest request must carry
+`Authorization: Bearer <token>`, else `401`. The token comes from
+`--ingest-token` / `JXSCOUT_INGEST_TOKEN`, or is generated once and stored in
+`<output-dir>/.jxscout-rs/ingest-token` (mode 0600); `--no-auth` disables it.
+The `Host` header must be a loopback name/address with the bound port
+(`403` otherwise, defeating DNS rebinding) and `Content-Type` must be
+`application/json` (`415`, defeating simple cross-site POSTs). These checks
+run before the body is read. Binding to a non-loopback address requires
+`--allow-remote-ingest` (which also disables the Host check).
 
 R-12. Non-Burp / non-Caido users must have standalone ingest paths `[#20]`:
 - R-12a. `curl` against the endpoint (documented with an example).
@@ -203,10 +209,14 @@ request, it forwards that request's authentication headers (default `Cookie`,
 `Authorization`; configurable list) so assets behind auth are downloaded
 correctly instead of a login redirect. `[#31]`
 
-R-61. **(design, security)** Forwarding is limited by `--forward-auth`:
-`same-origin` (default; scheme + host + port must equal the captured request's),
-`in-scope` (any in-scope origin, still no `https`→`http` downgrade), or `never`.
-On redirects to a different origin, forwarded credentials are dropped.
+R-61. **(design, security)** Captured credentials are only ever sent to the
+exact origin (scheme + host + port) of the captured request.
+`--forward-auth same-origin` (default) or `never`; there is deliberately no
+cross-origin mode. Once a redirect chain leaves the first origin no
+credentials are sent for the rest of the chain, and assets reached through a
+cross-origin redirect pass no credentials to the assets they reference. The
+trusted "parent" for scope exemptions is always the requested URL, never a
+redirect target.
 
 R-62. **(design)** Extra static headers can be supplied with `--header 'K: V'`
 (repeatable); they are sent only to in-scope origins and follow the same
@@ -275,7 +285,11 @@ R-93. CLI subcommands: `serve` (default), `ingest-urls`, `ingest-har`,
 `rules`, `analyze <file>`, `truncate`. `[README]` (prompt command list)
 
 R-94. `--debug` enables verbose logs; logs are also written to
-`~/.jxscout-rs/jxscout.log`. `[README]` (Troubleshooting → View logs)
+`<output-dir>/.jxscout-rs/jxscout.log`. `[README]` (Troubleshooting → View logs)
+
+R-95. **(design, security)** Text derived from analyzed code (URLs, finding
+values, categories, log messages) is escaped before it reaches a terminal;
+categories are restricted to a safe alphabet when created.
 
 ## 11. Non-goals for v0.1
 

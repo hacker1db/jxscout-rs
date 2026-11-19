@@ -376,8 +376,16 @@ impl Pipeline {
     fn spawn_child(&self, url: Url, origin: Origin, cx: &ItemCtx<'_>) {
         let mut child = Captured::url_only(url, origin);
         child.depth = cx.depth + 1;
-        child.parent = Some(cx.base.clone());
-        child.auth = cx.auth.cloned();
+        // The parent used for scope / same-origin exemptions is the URL we
+        // *asked for* (it passed the scope check), never where a redirect
+        // took us. If a redirect left that origin, the children lose the
+        // captured credentials too: they must never reach another origin.
+        child.parent = Some(cx.url.clone());
+        child.auth = if cx.base.origin() == cx.url.origin() {
+            cx.auth.cloned()
+        } else {
+            None
+        };
         self.submit(child);
     }
 
@@ -546,9 +554,15 @@ impl Pipeline {
             let (map_url, bytes) = match candidate {
                 sourcemap::Candidate::Inline { bytes } => (format!("{js_url}#inline-map"), bytes),
                 sourcemap::Candidate::Remote { url, why } => {
+                    // Same rule as for chunks: the trusted parent is the
+                    // requested URL, and credentials don't follow a
+                    // cross-origin redirect.
+                    let auth = (cx.base.origin() == cx.url.origin())
+                        .then_some(cx.auth)
+                        .flatten();
                     let ctx = FetchContext::new(Purpose::SourceMap)
-                        .with_parent(Some(js_url))
-                        .with_auth(cx.auth);
+                        .with_parent(Some(cx.url))
+                        .with_auth(auth);
                     match inner.fetcher.get(&url, &ctx).await {
                         Ok(r) if r.is_success() => (url.to_string(), r.body),
                         Ok(r) => {

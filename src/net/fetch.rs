@@ -195,12 +195,9 @@ impl Fetcher {
             let target = url.origin();
             let allowed = match cfg.forward_auth {
                 ForwardAuth::Never => false,
+                // Captured credentials only ever go back to the exact origin
+                // (scheme + host + port) they were captured for (R-61).
                 ForwardAuth::SameOrigin => target == auth.origin,
-                ForwardAuth::InScope => {
-                    let downgrade = matches!(&auth.origin, url::Origin::Tuple(s, _, _) if s == "https")
-                        && url.scheme() == "http";
-                    target == auth.origin || (explicitly_in_scope && !downgrade)
-                }
             };
             if allowed {
                 append_all(&mut out, auth.headers.iter());
@@ -397,25 +394,6 @@ mod tests {
         );
         assert!(
             !f.headers_for(&u("https://cdn.app.test/x.js"), &ctx)
-                .contains_key("cookie")
-        );
-    }
-
-    #[test]
-    fn in_scope_forwarding_blocks_downgrade() {
-        let f = fetcher(&["*.app.test"], ForwardAuth::InScope);
-        let auth = auth_for("https://www.app.test/");
-        let ctx = FetchContext::new(Purpose::Chunk).with_auth(Some(&auth));
-        assert!(
-            f.headers_for(&u("https://cdn.app.test/x.js"), &ctx)
-                .contains_key("cookie")
-        );
-        assert!(
-            !f.headers_for(&u("http://cdn.app.test/x.js"), &ctx)
-                .contains_key("cookie")
-        );
-        assert!(
-            !f.headers_for(&u("https://evil.test/x.js"), &ctx)
                 .contains_key("cookie")
         );
     }

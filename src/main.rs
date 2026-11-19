@@ -79,7 +79,7 @@ struct GlobalArgs {
     #[arg(long, default_value_t = 2, global = true)]
     retries: u32,
 
-    /// Forward captured auth headers: same-origin | in-scope | never.
+    /// Forward captured auth headers to the exact same origin: same-origin | never.
     #[arg(long, default_value = "same-origin", global = true)]
     forward_auth: ForwardAuth,
     /// Header names to forward from captured requests.
@@ -462,7 +462,7 @@ fn analyze_file(file: &Path, json: bool) -> anyhow::Result<()> {
                 file.display(),
                 f.line,
                 f.column,
-                f.category,
+                clean(&f.category),
                 clean(&f.value)
             );
         }

@@ -339,7 +339,11 @@ fn request_config(obj: &oxc_ast::ast::ObjectExpression<'_>) -> (Option<String>, 
             continue;
         };
         match key_name(&p.key).as_deref() {
-            Some("method" | "type") => verb = string_value(&p.value),
+            // Only known verbs: the value ends up in the category path.
+            Some("method" | "type") => {
+                verb = string_value(&p.value)
+                    .filter(|v| HTTP_METHODS.contains(&v.to_ascii_lowercase().as_str()))
+            }
             Some("url") => url = string_value(&p.value),
             _ => {}
         }

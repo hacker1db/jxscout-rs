@@ -455,7 +455,6 @@ async fn credentials_are_not_resent_after_leaving_the_origin() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = offline_config(tmp.path());
-    cfg.fetch.forward_auth = ForwardAuth::InScope;
     cfg.scope = Scope::from_patterns(["127.0.0.1"]);
     let p = pipeline(cfg);
     let runtime = r#"r.u = e => "js/" + e + "." + {1:"x"}[e] + ".js";"#;
@@ -504,4 +503,65 @@ async fn redirected_pages_resolve_against_final_url() {
         p.stats(),
         p.db().assets(None, 10, 0)
     );
+}
+
+/// Security review (2nd pass) #1: after a redirect to another origin, that
+/// origin does not become a trusted parent: its same-origin references get
+/// no scope exemption and no captured credentials.
+#[tokio::test]
+async fn redirect_target_is_not_a_trusted_parent() {
+    let a = MockServer::start().await; // the in-scope app
+    let b = MockServer::start().await; // a different origin
+    let b_url = b.uri();
+    let a_local = a.uri().replace("127.0.0.1", "localhost");
+    Mock::given(path("/js/1.x.js"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", format!("{b_url}/landing.js")),
+        )
+        .mount(&a)
+        .await;
+    // B serves a script whose chunk lives on B, outside the scope pattern.
+    Mock::given(path("/landing.js"))
+        .respond_with(js(r#"import("/evil.js");"#))
+        .mount(&b)
+        .await;
+    Mock::given(path("/evil.js"))
+        .respond_with(js("x()"))
+        .expect(0)
+        .mount(&b)
+        .await;
+    Mock::given(header_exists("cookie"))
+        .respond_with(ResponseTemplate::new(418))
+        .expect(0)
+        .mount(&b)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = offline_config(tmp.path());
+    // A by host; on B only the landing script itself is in scope.
+    cfg.scope = Scope::from_patterns(["localhost", &format!("{b_url}/landing.js")]);
+    let p = pipeline(cfg);
+    let runtime = r#"r.u = e => "js/" + e + "." + {1:"x"}[e] + ".js";"#;
+    run(
+        &p,
+        captured(
+            &format!("{a_local}/js/main.js"),
+            "application/javascript",
+            runtime,
+            &[("Cookie", "s=1")],
+        ),
+    )
+    .await;
+    // The redirected chunk itself was fetched (its final URL is in scope) …
+    assert!(
+        read(
+            &p,
+            &format!(
+                "{}/js/1.x.js",
+                host_dir(&a).replace("127.0.0.1", "localhost")
+            )
+        )
+        .is_some()
+    );
+    // … but `/evil.js` on B was not (expect(0) verified on drop).
 }

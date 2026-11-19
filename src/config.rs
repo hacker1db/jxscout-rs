@@ -16,8 +16,6 @@ pub enum ForwardAuth {
     /// Only to the exact origin (scheme + host + port) of the captured request.
     #[default]
     SameOrigin,
-    /// To any in-scope origin, but never across an https → http downgrade.
-    InScope,
     /// Never forward.
     Never,
 }
@@ -28,10 +26,9 @@ impl std::str::FromStr for ForwardAuth {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "same-origin" => Ok(Self::SameOrigin),
-            "in-scope" => Ok(Self::InScope),
             "never" => Ok(Self::Never),
             other => Err(format!(
-                "unknown forward-auth mode `{other}` (expected same-origin, in-scope, never)"
+                "unknown forward-auth mode `{other}` (expected same-origin or never)"
             )),
         }
     }
@@ -169,7 +166,8 @@ mod tests {
     #[test]
     fn forward_auth_parses() {
         assert_eq!("same-origin".parse(), Ok(ForwardAuth::SameOrigin));
-        assert_eq!("in-scope".parse(), Ok(ForwardAuth::InScope));
+        // Cross-origin forwarding was removed on purpose (security review).
+        assert!("in-scope".parse::<ForwardAuth>().is_err());
         assert_eq!("never".parse(), Ok(ForwardAuth::Never));
         assert!("bogus".parse::<ForwardAuth>().is_err());
     }
