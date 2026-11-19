@@ -120,3 +120,9 @@ One design replaces the earlier patches: `src/budget.rs` (`Budget` + RAII `Reser
 | # | Sev | Finding | Action |
 | --- | --- | --- | --- |
 | 1 | Med | Streaming charged `body.len()`, but `Vec` doubling can allocate ~2× | Fixed: `BodyBuf` starts at the reserved size (announced length, or 64 KiB when unknown), grows the reservation to the new capacity *before* `reserve_exact`, re-charges whatever capacity it actually got, and at the end `shrink_to_fit()` then `shrink_to(capacity)`. Test `body_buffer_reservation_covers_capacity` asserts reserved ≥ capacity at every step |
+
+## Security review, 6th pass (security-guidance plugin, on `c5e095f`)
+
+| # | Sev | Finding | Action |
+| --- | --- | --- | --- |
+| 1 | Med | Buffer preallocated from untrusted Content-Length while `reserve` could silently grant less | Fixed: `Budget::reserve` grants exactly the request or returns `None` (never clamps); a Content-Length above the whole budget is refused with `OverBudget` before reserving or allocating; the buffer starts at ≤ 64 KiB and grows inside the reservation (charging anything beyond it first); `BodyBuf` `debug_assert!`s reserved ≥ capacity after construction and every push. Test `content_length_over_budget_is_refused` (peak stays 0) |

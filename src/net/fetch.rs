@@ -359,14 +359,25 @@ impl Fetcher {
         );
         // Reserve memory before reading a single body byte. The task calling
         // us holds no other reservation, so waiting here can't deadlock.
-        let initial = match resp.content_length() {
-            Some(n) => n.min(limit) as usize,
-            None => UNKNOWN_LENGTH_START.min(limit as usize),
-        };
+        // Content-Length is untrusted. It sizes the *reservation* (so a
+        // download waits for room up front instead of failing halfway
+        // under contention) and refuses early when it can never fit, but
+        // the buffer itself starts small and grows inside the reservation;
+        // anything beyond it must be charged first (`BodyBuf::charge`).
+        if let (Some(b), Some(n)) = (&self.inner.budget, resp.content_length())
+            && n > b.capacity() as u64
+        {
+            return Err(FetchError::OverBudget);
+        }
+        let reserve = resp
+            .content_length()
+            .unwrap_or(UNKNOWN_LENGTH_START as u64)
+            .min(limit) as usize;
         let memory = match &self.inner.budget {
-            Some(b) => Some(b.reserve(initial).await),
+            Some(b) => Some(b.reserve(reserve).await.ok_or(FetchError::OverBudget)?),
             None => None,
         };
+        let initial = reserve.min(UNKNOWN_LENGTH_START);
         let mut body = BodyBuf::new(initial, limit, memory);
         while let Some(chunk) = resp.chunk().await? {
             body.push(&chunk)?;
@@ -397,10 +408,26 @@ struct BodyBuf {
 
 impl BodyBuf {
     fn new(initial: usize, limit: u64, memory: Option<Reservation>) -> Self {
-        Self {
-            buf: Vec::with_capacity(initial),
+        // Never allocate more than is reserved.
+        let cap = memory.as_ref().map_or(initial, |m| initial.min(m.bytes()));
+        let b = Self {
+            buf: Vec::with_capacity(cap),
             limit,
             memory,
+        };
+        b.debug_check();
+        b
+    }
+
+    /// The invariant: reserved bytes cover the buffer's capacity.
+    fn debug_check(&self) {
+        if let Some(m) = &self.memory {
+            debug_assert!(
+                m.bytes() >= self.buf.capacity(),
+                "{} < {}",
+                m.bytes(),
+                self.buf.capacity()
+            );
         }
     }
 
@@ -413,13 +440,22 @@ impl BodyBuf {
         if new_len > self.buf.capacity() {
             // Grow geometrically (amortized O(1) appends) but never past
             // the download cap, and charge the new capacity first.
-            let target = new_len.max((self.buf.capacity() * 2).min(self.limit as usize));
+            let doubled = (self.buf.capacity() * 2).min(self.limit as usize);
+            let reserved = self.memory.as_ref().map_or(usize::MAX, Reservation::bytes);
+            // Stay inside the reservation while the body fits in it (no new
+            // budget needed); beyond it, grow geometrically and charge.
+            let target = if new_len <= reserved {
+                new_len.max(doubled.min(reserved))
+            } else {
+                new_len.max(doubled)
+            };
             self.charge(target)?;
             self.buf.reserve_exact(target - self.buf.len());
             // `reserve_exact` may round up; cover whatever we really got.
             self.charge(self.buf.capacity())?;
         }
         self.buf.extend_from_slice(chunk);
+        self.debug_check();
         Ok(())
     }
 
@@ -487,7 +523,7 @@ mod tests {
     #[tokio::test]
     async fn body_buffer_reservation_covers_capacity() {
         let budget = crate::budget::Budget::new(1024 * 1024);
-        let res = budget.reserve(100).await;
+        let res = budget.reserve(100).await.unwrap();
         let mut b = BodyBuf::new(100, 600 * 1024, Some(res));
         for i in 0..200 {
             b.push(&vec![b'x'; 1000 + i * 7]).unwrap();
@@ -510,8 +546,37 @@ mod tests {
             Err(FetchError::TooLarge { .. })
         ));
         let tiny = crate::budget::Budget::new(2048);
-        let mut over = BodyBuf::new(1024, 1 << 20, Some(tiny.reserve(1024).await));
+        let mut over = BodyBuf::new(1024, 1 << 20, Some(tiny.reserve(1024).await.unwrap()));
         assert!(matches!(over.push(&[0; 4096]), Err(FetchError::OverBudget)));
+    }
+
+    /// Security review (6th pass): a Content-Length larger than the whole
+    /// budget is refused before any body allocation.
+    #[tokio::test]
+    async fn content_length_over_budget_is_refused() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(path("/big.js"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'a'; 256 * 1024]))
+            .mount(&server)
+            .await;
+        let cfg = FetchConfig {
+            allow_private_targets: true,
+            max_rps: 0,
+            ..FetchConfig::default()
+        };
+        let budget = crate::budget::Budget::new(64 * 1024);
+        let f =
+            Fetcher::with_budget(cfg, Arc::new(Scope::default()), false, budget.clone()).unwrap();
+        let url = u(&format!("{}/big.js", server.uri()));
+        let err = f
+            .get(&url, &FetchContext::new(Purpose::Captured))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::OverBudget), "{err}");
+        assert_eq!(budget.in_use(), 0);
+        assert_eq!(budget.peak(), 0, "nothing was reserved or allocated");
     }
 
     #[test]

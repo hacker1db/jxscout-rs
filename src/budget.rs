@@ -80,20 +80,25 @@ impl Budget {
         self.inner.peak_units.load(Ordering::Acquire) * UNIT
     }
 
-    /// Reserve `bytes`, waiting for room. Requests larger than the whole
-    /// budget are clamped to it (the caller's hard size cap still applies).
-    /// Only call this while holding no other reservation.
-    pub async fn reserve(&self, bytes: usize) -> Reservation {
-        let n = units(bytes).min(self.inner.total_units);
+    /// Reserve exactly `bytes`, waiting for room. Returns `None` (without
+    /// waiting) if the request is larger than the whole budget: it could
+    /// never be granted, and silently granting less would let the caller
+    /// allocate more than it reserved. Only call this while holding no
+    /// other reservation.
+    pub async fn reserve(&self, bytes: usize) -> Option<Reservation> {
+        let n = units(bytes);
+        if n > self.inner.total_units {
+            return None;
+        }
         let permit = Arc::clone(&self.inner.sem)
             .acquire_many_owned(n as u32)
             .await
             .expect("budget semaphore is never closed");
         self.inner.record_peak();
-        Reservation {
+        Some(Reservation {
             budget: self.clone(),
             permit,
-        }
+        })
     }
 
     /// Reserve `bytes` only if room is available right now.
@@ -162,7 +167,7 @@ mod tests {
     #[tokio::test]
     async fn reserve_grow_shrink_release() {
         let b = Budget::new(10 * UNIT);
-        let mut r = b.reserve(3 * UNIT).await;
+        let mut r = b.reserve(3 * UNIT).await.unwrap();
         assert_eq!((r.bytes(), b.in_use()), (3 * UNIT, 3 * UNIT));
         assert!(r.try_grow(8 * UNIT));
         assert_eq!(b.in_use(), 8 * UNIT);
@@ -178,9 +183,9 @@ mod tests {
     #[tokio::test]
     async fn waiters_get_room_when_holders_drop() {
         let b = Budget::new(4 * UNIT);
-        let held = b.reserve(4 * UNIT).await;
+        let held = b.reserve(4 * UNIT).await.unwrap();
         let b2 = b.clone();
-        let waiter = tokio::spawn(async move { b2.reserve(2 * UNIT).await.bytes() });
+        let waiter = tokio::spawn(async move { b2.reserve(2 * UNIT).await.unwrap().bytes() });
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
         drop(held);
@@ -192,7 +197,7 @@ mod tests {
     async fn oversized_requests() {
         let b = Budget::new(4 * UNIT);
         assert!(b.try_reserve(5 * UNIT).is_none());
-        // `reserve` clamps instead of waiting forever.
-        assert_eq!(b.reserve(100 * UNIT).await.bytes(), 4 * UNIT);
+        // Never silently granted less, never waits forever.
+        assert!(b.reserve(100 * UNIT).await.is_none());
     }
 }
