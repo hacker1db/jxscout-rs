@@ -203,8 +203,10 @@ written. Defaults are strict:
   `--allow-private-targets` when you test an internal app on purpose.
 - **Scope on every hop**: each redirect hop must be in scope or same-origin
   with the asset that referenced it.
-- **Limits**: 20 MiB per download (decompressed, `--max-download-mb`), 30 s
-  timeouts, depth 3, chunk and source budgets, 2 req/s by default.
+- **Limits**: 20 MiB per download (decompressed, `--max-download-mb`), a
+  512 MiB memory budget for all bodies held at once (`--memory-budget-mb`,
+  reserved before a body is read), 30 s timeouts, depth 3, chunk and source
+  budgets, 2 req/s by default.
 - **Ingest endpoint**: loopback only (`--allow-remote-ingest` to change),
   bearer token by default (`--no-auth` to disable), `Host` header checked
   against loopback names to block DNS rebinding, JSON-only to block

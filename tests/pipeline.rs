@@ -650,15 +650,44 @@ async fn fetched_bodies_respect_the_memory_budget() {
     let mut cfg = config(tmp.path());
     let budget = 1024 * 1024; // room for one script + one map, not two scripts
     cfg.discovery.memory_budget = budget;
+    // Many downloads in flight at once: each must reserve before reading.
+    cfg.fetch.concurrency = 8;
     let p = pipeline(cfg);
     for i in 0..8 {
         let url = Url::parse(&format!("{}/s{i}.js", server.uri())).unwrap();
-        assert!(p.submit(Captured::url_only(url, Origin::UrlList)));
+        p.submit_wait(Captured::url_only(url, Origin::UrlList))
+            .await;
+    }
+    // Captured scripts with ~200 KiB inline maps: the decoded map is its own
+    // admitted work item with its own reservation.
+    let inline_map = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(format!(
+            r#"{{"version":3,"sources":["i.js"],"sourcesContent":["{}"],"names":[],"mappings":""}}"#,
+            "c".repeat(200 * 1024)
+        ))
+    };
+    for i in 0..4 {
+        let body =
+            format!("x{i}()\n//# sourceMappingURL=data:application/json;base64,{inline_map}");
+        let mut item = captured(
+            &format!("{}/inline{i}.js", server.uri()),
+            "application/javascript",
+            &body,
+            &[],
+        );
+        item.origin = Origin::Har;
+        p.submit_wait(item).await;
     }
     p.wait_idle().await;
 
     let s = p.stats();
-    assert_eq!((s.saved, s.sourcemaps, s.errors), (8, 8, 0), "{s:?}");
+    // Remote maps are admitted without bytes and wait for room inside the
+    // fetcher, so none are lost. Inline maps arrive with their bytes and are
+    // skipped (logged) when the budget is full at that moment.
+    assert_eq!((s.saved, s.errors), (12, 0), "{s:?}");
+    assert!((8..=12).contains(&s.sourcemaps), "{s:?}");
+    assert_eq!(p.budget().in_use(), 0, "every reservation was released");
     assert!(
         p.peak_memory_bytes() <= budget,
         "peak {} > budget {budget}",

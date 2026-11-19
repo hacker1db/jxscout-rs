@@ -144,6 +144,18 @@ max recursion depth (default 3), max chunk URLs per script (default
 bruteforce limit + 1000), max source-map sources written per map (default
 10 000). **(design, security)**
 
+R-37. **(design, security)** A memory budget (`--memory-budget-mb`, default
+512) covers every response body the pipeline holds: captured bodies are
+charged at admission, tool-fetched bodies are reserved after response
+headers arrive and *before* the body is read (announced length or the
+download cap), grown per chunk and shrunk to the real size. Every unit of
+work (captured item, chunk, remote source-map lookup, inline source map)
+is scheduled through one admission path that takes a work slot and its
+reservation. Work that already holds bytes and finds no room is skipped
+with a debug log; work that only *will* fetch waits for room. Holders never
+wait for more budget, so the budget cannot deadlock. Inline and remote
+source-map candidates are evaluated as separate work items.
+
 ## 5. Processing pipeline
 
 R-40. HTML responses: save the page, extract `<script src>` URLs and inline

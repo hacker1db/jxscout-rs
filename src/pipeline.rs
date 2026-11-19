@@ -26,6 +26,7 @@ use tokio::sync::Semaphore;
 use tokio_util::task::TaskTracker;
 use url::Url;
 
+use crate::budget::{Budget, Reservation};
 use crate::config::Config;
 use crate::events::{AssetKind, Event, EventBus};
 use crate::js::{self, chunks, html, sourcemap};
@@ -86,50 +87,46 @@ pub const MAX_PENDING: usize = 20_000;
 /// (captured bodies, fetched pages/scripts/chunks, and source maps).
 pub const DEFAULT_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
 
-/// The byte budget is a semaphore with one permit per KiB, so holders can
-/// `await` room (backpressure) and release it automatically on drop.
-const BUDGET_UNIT: usize = 1024;
-
-fn units(bytes: usize) -> u32 {
-    bytes.div_ceil(BUDGET_UNIT).max(1).min(u32::MAX as usize) as u32
+/// Everything the pipeline schedules goes through [`Pipeline::admit`] as
+/// one of these, so every unit of work takes a slot *and* has its bytes
+/// covered by a [`Reservation`].
+enum Work {
+    /// A captured or discovered request/response.
+    Item(Captured),
+    /// A source-map lookup for one script (remote candidates).
+    Map(MapJob),
+    /// An inline (`data:`) source map, already decoded.
+    InlineMap(InlineMapJob),
 }
 
-/// Item count + memory budget.
-#[derive(Debug)]
-struct Admission {
-    items: AtomicUsize,
-    memory: Arc<Semaphore>,
-    total_units: u32,
-    /// Highest number of KiB units ever held at once (for tests/stats).
-    peak_units: AtomicUsize,
-}
-
-impl Admission {
-    fn new(budget_bytes: usize) -> Self {
-        let total_units = units(budget_bytes).min(Semaphore::MAX_PERMITS as u32);
-        Self {
-            items: AtomicUsize::new(0),
-            memory: Arc::new(Semaphore::new(total_units as usize)),
-            total_units,
-            peak_units: AtomicUsize::new(0),
+impl Work {
+    /// Bytes this work already holds in memory when admitted.
+    fn bytes(&self) -> usize {
+        match self {
+            Work::Item(item) => body_len(item),
+            Work::Map(_) => 0,
+            Work::InlineMap(j) => j.bytes.len(),
         }
     }
 
-    fn record_peak(&self) {
-        let used = self.total_units as usize - self.memory.available_permits();
-        self.peak_units.fetch_max(used, Ordering::AcqRel);
+    fn describe(&self) -> String {
+        match self {
+            Work::Item(item) => item.request.url.to_string(),
+            Work::Map(j) => format!("source map for {}", j.js_url),
+            Work::InlineMap(j) => format!("inline source map for {}", j.js_url),
+        }
     }
 }
 
-/// Releases one item slot (and, if held, the captured body's bytes) on drop.
+/// Holds a work slot and the work's memory for as long as it runs.
 struct AdmitGuard {
-    adm: Arc<Admission>,
-    _memory: Option<tokio::sync::OwnedSemaphorePermit>,
+    items: Arc<AtomicUsize>,
+    _memory: Option<Reservation>,
 }
 
 impl Drop for AdmitGuard {
     fn drop(&mut self) {
-        self.adm.items.fetch_sub(1, Ordering::AcqRel);
+        self.items.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -153,8 +150,10 @@ struct Inner {
     /// URLs already handled this session (derived items only).
     seen: Mutex<HashSet<String>>,
     tracker: TaskTracker,
-    /// Items submitted but not finished (bounded admission).
-    admission: Arc<Admission>,
+    /// Work items queued or running (bounded admission).
+    items: Arc<AtomicUsize>,
+    /// Memory budget for every body the pipeline holds.
+    budget: Budget,
     /// Bounds CPU-heavy parse/analyze work.
     cpu: Semaphore,
     stats: Stats,
@@ -177,13 +176,14 @@ impl Pipeline {
         let db_file = db_path(&cfg.output_dir, &cfg.project);
         std::fs::create_dir_all(db_file.parent().expect("db path has a parent"))?;
         let db = Db::open(&db_file).with_context(|| format!("opening {}", db_file.display()))?;
-        let fetcher = Fetcher::new(
+        let budget = Budget::new(cfg.discovery.memory_budget);
+        let fetcher = Fetcher::with_budget(
             cfg.fetch.clone(),
             Arc::new(cfg.scope.clone()),
             cfg.download_referred_js,
+            budget.clone(),
         )?;
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let memory_budget = cfg.discovery.memory_budget;
         Ok(Self {
             inner: Arc::new(Inner {
                 cfg,
@@ -194,7 +194,8 @@ impl Pipeline {
                 events,
                 seen: Mutex::new(HashSet::new()),
                 tracker: TaskTracker::new(),
-                admission: Arc::new(Admission::new(memory_budget)),
+                items: Arc::new(AtomicUsize::new(0)),
+                budget,
                 cpu: Semaphore::new(cpus),
                 stats: Stats::default(),
             }),
@@ -217,103 +218,102 @@ impl Pipeline {
         self.inner.stats.snapshot()
     }
 
-    /// Reserve room for one item of `bytes` body size. The returned guard
-    /// gives the room back when dropped (RAII), including on panic or
-    /// cancellation.
-    fn try_admit(&self, bytes: usize) -> Option<AdmitGuard> {
-        let adm = &self.inner.admission;
-        if adm.items.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING {
-            adm.items.fetch_sub(1, Ordering::AcqRel);
-            return None;
-        }
-        // Captured bodies are already in memory: charge them now (fallible).
-        let memory = if bytes > 0 {
-            match adm.memory.clone().try_acquire_many_owned(units(bytes)) {
-                Ok(p) => Some(p),
-                Err(_) => {
-                    adm.items.fetch_sub(1, Ordering::AcqRel);
-                    return None;
-                }
-            }
-        } else {
-            None
+    /// The single entry point for scheduling work. Takes a work slot and
+    /// a reservation for the bytes the work already holds; refuses (and
+    /// drops the work) when either is unavailable. Bytes the work fetches
+    /// later are reserved by the fetcher before they are read.
+    fn admit(&self, work: Work) -> bool {
+        let Some(guard) = self.try_guard(work.bytes()) else {
+            tracing::debug!(
+                "pipeline at capacity (items or memory budget), skipping {}",
+                crate::text::clean(&work.describe())
+            );
+            return false;
         };
-        adm.record_peak();
-        Some(AdmitGuard {
-            adm: Arc::clone(adm),
-            _memory: memory,
-        })
+        self.spawn_work(work, guard);
+        true
     }
 
-    /// Reserve memory for `bytes` of fetched data, waiting for room. Bodies
-    /// fetched by the tool (URL-only items, chunks, source maps) are charged
-    /// here, right after download and before any further processing, so
-    /// the number of bodies held at once is bounded by the budget. The
-    /// fetch itself is capped by `max_body_bytes` while streaming.
-    async fn reserve_memory(&self, bytes: usize) -> tokio::sync::OwnedSemaphorePermit {
-        let adm = &self.inner.admission;
-        let wanted = units(bytes).min(adm.total_units);
-        let permit = adm
-            .memory
-            .clone()
-            .acquire_many_owned(wanted)
-            .await
-            .expect("memory semaphore is never closed");
-        adm.record_peak();
-        permit
-    }
-
-    /// Highest number of body bytes held at once so far (approximate, KiB
-    /// granularity).
-    pub fn peak_memory_bytes(&self) -> usize {
-        self.inner.admission.peak_units.load(Ordering::Acquire) * BUDGET_UNIT
-    }
-
-    fn spawn_admitted(&self, item: Captured, guard: AdmitGuard) {
-        let this = self.clone();
-        self.inner.tracker.spawn(async move {
-            let _guard = guard;
-            this.process(item).await;
-        });
-    }
-
-    /// Queue an item; returns immediately. Returns `false` (and drops the
-    /// item) when [`MAX_PENDING`] items are queued or a captured body
-    /// doesn't fit the memory budget, so a flood of ingest requests or a huge chunk
-    /// fan-out can't exhaust memory.
-    pub fn submit(&self, item: Captured) -> bool {
-        match self.try_admit(body_len(&item)) {
-            Some(guard) => {
-                self.spawn_admitted(item, guard);
-                true
-            }
-            None => {
-                tracing::warn!(url = %item.request.url, "pipeline overloaded, dropping item");
-                false
-            }
-        }
-    }
-
-    /// Like [`submit`](Self::submit) but waits for room instead of
-    /// dropping: backpressure for file-based sources.
-    pub async fn submit_wait(&self, item: Captured) {
-        let bytes = body_len(&item);
-        if units(bytes) > self.inner.admission.total_units {
-            tracing::warn!(url = %item.request.url, "item body larger than the queue budget, dropping");
+    /// Like [`admit`](Self::admit) but waits for room (backpressure for
+    /// file-based sources). Called only from ingest sources, which hold no
+    /// reservation, so waiting can't deadlock.
+    async fn admit_wait(&self, work: Work) {
+        let bytes = work.bytes();
+        if bytes > self.inner.budget.capacity() {
+            tracing::warn!(
+                "{} is larger than the memory budget, dropping",
+                crate::text::clean(&work.describe())
+            );
             return;
         }
         loop {
-            if let Some(guard) = self.try_admit(bytes) {
-                self.spawn_admitted(item, guard);
+            if let Some(guard) = self.try_guard(bytes) {
+                self.spawn_work(work, guard);
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
 
-    /// Items queued or in progress.
+    fn try_guard(&self, bytes: usize) -> Option<AdmitGuard> {
+        let items = &self.inner.items;
+        if items.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING {
+            items.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        let memory = if bytes > 0 {
+            match self.inner.budget.try_reserve(bytes) {
+                Some(r) => Some(r),
+                None => {
+                    items.fetch_sub(1, Ordering::AcqRel);
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        Some(AdmitGuard {
+            items: Arc::clone(items),
+            _memory: memory,
+        })
+    }
+
+    fn spawn_work(&self, work: Work, guard: AdmitGuard) {
+        let this = self.clone();
+        self.inner.tracker.spawn(async move {
+            let _guard = guard; // released when the work finishes
+            match work {
+                Work::Item(item) => this.process(item).await,
+                Work::Map(job) => this.find_sourcemap(job).await,
+                Work::InlineMap(job) => this.inline_sourcemap(job).await,
+            }
+        });
+    }
+
+    /// Queue an item; returns immediately. Returns `false` (and drops the
+    /// item) when the pipeline is at capacity.
+    pub fn submit(&self, item: Captured) -> bool {
+        self.admit(Work::Item(item))
+    }
+
+    /// Queue an item, waiting for capacity instead of dropping it.
+    pub async fn submit_wait(&self, item: Captured) {
+        self.admit_wait(Work::Item(item)).await;
+    }
+
+    /// Work items queued or in progress.
     pub fn pending(&self) -> usize {
-        self.inner.admission.items.load(Ordering::Acquire)
+        self.inner.items.load(Ordering::Acquire)
+    }
+
+    /// The memory budget (for diagnostics and tests).
+    pub fn budget(&self) -> &Budget {
+        &self.inner.budget
+    }
+
+    /// Highest number of body bytes reserved at once so far.
+    pub fn peak_memory_bytes(&self) -> usize {
+        self.inner.budget.peak()
     }
 
     /// Wait until every submitted item and everything it spawned is done.
@@ -399,8 +399,8 @@ impl Pipeline {
         // `final_url` is where the bytes really came from (after redirects);
         // relative references resolve against it. `url` stays the DB key.
         let mut auth = auth;
-        // Held until this item is fully processed.
-        let mut _fetched_memory = None;
+        // The fetched body's reservation, held until this item is done.
+        let mut _fetched_memory: Option<Reservation> = None;
         let (response, final_url) = match item.response {
             Some(r) => (r, url.clone()),
             None => {
@@ -417,7 +417,7 @@ impl Pipeline {
                     .get(&url, &ctx)
                     .await
                     .with_context(|| format!("fetching {url}"))?;
-                _fetched_memory = Some(self.reserve_memory(r.body.len()).await);
+                _fetched_memory = r.memory;
                 // Credential eligibility doesn't come back after leaving the
                 // origin, even if the chain returned to it (R-61).
                 if !r.stayed_on_origin {
@@ -521,7 +521,9 @@ impl Pipeline {
         } else {
             None
         };
-        self.submit(child);
+        if !self.admit(Work::Item(child)) {
+            tracing::debug!("child not scheduled (pipeline at capacity)");
+        }
     }
 
     async fn save(
@@ -643,21 +645,34 @@ impl Pipeline {
             // Runs as its own task so the map download doesn't wait for
             // memory while this item still holds its script's share (the
             // budget semaphore is FIFO-fair, so that could deadlock).
-            let job = MapJob {
-                candidates: sourcemap::candidates(&asset.base, &asset.headers, &asset.text),
-                js_url: asset.base.clone(),
-                db_url: asset.db_url.clone(),
-                parent: cx.url.clone(),
-                // Same rule as for chunks: credentials don't follow a
-                // cross-origin redirect.
-                auth: (cx.base.origin() == cx.url.origin())
-                    .then(|| cx.auth.cloned())
-                    .flatten(),
-            };
-            let this = self.clone();
-            self.inner
-                .tracker
-                .spawn(async move { this.find_sourcemap(job).await });
+            let mut remote = Vec::new();
+            for candidate in sourcemap::candidates(&asset.base, &asset.headers, &asset.text) {
+                match candidate {
+                    sourcemap::Candidate::Remote { url, why } => remote.push((url, why)),
+                    // Inline maps are their own work item so their bytes are
+                    // charged to the budget like any other body.
+                    sourcemap::Candidate::Inline { bytes } => {
+                        self.admit(Work::InlineMap(InlineMapJob {
+                            js_url: asset.base.clone(),
+                            db_url: asset.db_url.clone(),
+                            bytes,
+                        }));
+                    }
+                }
+            }
+            if !remote.is_empty() {
+                self.admit(Work::Map(MapJob {
+                    remote,
+                    js_url: asset.base.clone(),
+                    db_url: asset.db_url.clone(),
+                    parent: cx.url.clone(),
+                    // Same rule as for chunks: credentials don't follow a
+                    // cross-origin redirect.
+                    auth: (cx.base.origin() == cx.url.origin())
+                        .then(|| cx.auth.cloned())
+                        .flatten(),
+                }));
+            }
         }
         Ok(())
     }
@@ -698,64 +713,77 @@ impl Pipeline {
         out
     }
 
-    /// Try every source-map candidate; the first that validates wins (R-71).
+    /// Try remote candidates in priority order; the first that validates
+    /// wins (R-71). Each download is charged to the budget by the fetcher
+    /// before its body is read, and released before the next attempt.
     async fn find_sourcemap(&self, job: MapJob) {
         let inner = &self.inner;
-        let js_url = &job.js_url;
-        for candidate in job.candidates {
-            let (map_url, bytes, _map_memory) = match candidate {
-                sourcemap::Candidate::Inline { bytes } => {
-                    (format!("{js_url}#inline-map"), bytes, None)
+        for (url, why) in &job.remote {
+            // The trusted parent is the requested script URL.
+            let ctx = FetchContext::new(Purpose::SourceMap)
+                .with_parent(Some(&job.parent))
+                .with_auth(job.auth.as_ref());
+            let r = match inner.fetcher.get(url, &ctx).await {
+                Ok(r) if r.is_success() => r,
+                Ok(r) => {
+                    tracing::debug!(%url, status = r.status, why, "source map candidate rejected");
+                    continue;
                 }
-                sourcemap::Candidate::Remote { url, why } => {
-                    // The trusted parent is the requested URL.
-                    let ctx = FetchContext::new(Purpose::SourceMap)
-                        .with_parent(Some(&job.parent))
-                        .with_auth(job.auth.as_ref());
-                    match inner.fetcher.get(&url, &ctx).await {
-                        Ok(r) if r.is_success() => {
-                            // Charge the map against the memory budget while
-                            // it's parsed and written.
-                            let permit = self.reserve_memory(r.body.len()).await;
-                            (url.to_string(), r.body, Some(permit))
-                        }
-                        Ok(r) => {
-                            tracing::debug!(%url, status = r.status, why, "source map candidate rejected");
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::debug!(%url, why, "source map candidate failed: {e}");
-                            continue;
-                        }
-                    }
+                Err(e) => {
+                    tracing::debug!(%url, why, "source map candidate failed: {e}");
+                    continue;
                 }
             };
-            match sourcemap::reverse(&bytes, inner.cfg.discovery.max_sourcemap_sources) {
-                Ok(rev) => {
-                    let missing = rev.missing_content.len();
-                    let written = self.write_sources(js_url.clone(), rev).await;
-                    if missing > 0 {
-                        tracing::info!(
-                            map = %map_url,
-                            "{missing} source(s) listed without sourcesContent"
-                        );
-                    }
-                    if let Err(e) = inner.db.record_sourcemap(&job.db_url, &map_url, written) {
-                        tracing::warn!("recording source map: {e}");
-                    }
-                    bump(&inner.stats.sourcemaps, 1);
-                    tracing::info!(js = %js_url, map = %map_url, "reversed {written} source file(s)");
-                    inner.events.emit(Event::SourceMapReversed {
-                        js_url: job.db_url.clone(),
-                        map_url,
-                        sources: written,
-                    });
-                    return;
-                }
-                Err(e) => tracing::debug!(map = %map_url, "not a valid source map: {e}"),
+            // `r.memory` covers `r.body` until `r` is dropped.
+            if self
+                .apply_sourcemap(&job.js_url, &job.db_url, url.as_str(), &r.body)
+                .await
+            {
+                return;
             }
         }
-        tracing::debug!(js = %js_url, "no source map found");
+        tracing::debug!(js = %job.js_url, "no source map found");
+    }
+
+    /// An inline `data:` map; its bytes were charged at admission.
+    async fn inline_sourcemap(&self, job: InlineMapJob) {
+        let map_url = format!("{}#inline-map", job.js_url);
+        self.apply_sourcemap(&job.js_url, &job.db_url, &map_url, &job.bytes)
+            .await;
+    }
+
+    /// Validate and reverse one map. Returns `true` on success.
+    async fn apply_sourcemap(
+        &self,
+        js_url: &Url,
+        db_url: &str,
+        map_url: &str,
+        bytes: &[u8],
+    ) -> bool {
+        let inner = &self.inner;
+        let rev = match sourcemap::reverse(bytes, inner.cfg.discovery.max_sourcemap_sources) {
+            Ok(rev) => rev,
+            Err(e) => {
+                tracing::debug!(map = %map_url, "not a valid source map: {e}");
+                return false;
+            }
+        };
+        let missing = rev.missing_content.len();
+        let written = self.write_sources(js_url.clone(), rev).await;
+        if missing > 0 {
+            tracing::info!(map = %map_url, "{missing} source(s) listed without sourcesContent");
+        }
+        if let Err(e) = inner.db.record_sourcemap(db_url, map_url, written) {
+            tracing::warn!("recording source map: {e}");
+        }
+        bump(&inner.stats.sourcemaps, 1);
+        tracing::info!(js = %js_url, map = %map_url, "reversed {written} source file(s)");
+        inner.events.emit(Event::SourceMapReversed {
+            js_url: db_url.to_string(),
+            map_url: map_url.to_string(),
+            sources: written,
+        });
+        true
     }
 
     /// Write recovered sources on the blocking pool (it can be thousands
@@ -782,9 +810,17 @@ impl Pipeline {
     }
 }
 
-/// A source-map lookup, run as its own task (see `handle_js`).
+/// An inline source map, run as its own work item.
+struct InlineMapJob {
+    js_url: Url,
+    db_url: String,
+    bytes: Vec<u8>,
+}
+
+/// A remote source-map lookup, run as its own work item (see `handle_js`).
 struct MapJob {
-    candidates: Vec<sourcemap::Candidate>,
+    /// Remote candidates in priority order, with why each was suggested.
+    remote: Vec<(Url, &'static str)>,
     /// URL the map references resolve against (final URL of the script).
     js_url: Url,
     /// Database key of the script.

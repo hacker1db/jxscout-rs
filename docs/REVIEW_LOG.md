@@ -105,3 +105,12 @@ Scoped to `src/rules`, `src/tui`, `src/js/chunks.rs`.
 | # | Sev | Finding | Action |
 | --- | --- | --- | --- |
 | 1 | Med | Memory budget only charged captured bodies; URL-only items, chunks, and source maps were fetched at "0 bytes" | Fixed: the budget is now a KiB-unit semaphore (`DiscoveryConfig::memory_budget`, default 512 MiB). Captured bodies are charged at admission (fallible, so HTTP gets 503); every tool-fetched body (pages, scripts, chunks, maps) is charged right after download and held until its processing ends; children go through the same path. Downloads already stream with a hard `max_body_bytes` cutoff, and in-flight downloads are bounded by `--fetch-concurrency`. Source-map lookups run as their own task, so no budget holder ever waits for more budget (no deadlock under the FIFO-fair semaphore). Test `fetched_bodies_respect_the_memory_budget`: 8 × 600 KiB scripts plus 300 KiB maps under a 1 MiB budget, all saved, peak ≤ budget |
+
+## Security review, 4th pass (security-guidance plugin, on `b122202`)
+
+One design replaces the earlier patches: `src/budget.rs` (`Budget` + RAII `Reservation`, grow/shrink, peak tracking) is the only way bytes enter the pipeline.
+
+| # | Sev | Finding | Action |
+| --- | --- | --- | --- |
+| 1 | Med | Fetched bodies charged only after being buffered | Fixed: `Fetcher::with_budget` reserves after response headers and before reading the body (announced length or `max_body_bytes`), `try_grow`s per chunk (hard cutoff, `OverBudget` error), and `shrink_to`s the real size; the reservation travels in `FetchResponse::memory` and lives as long as the body |
+| 2 | Med | Source-map jobs spawned without admission; inline map bytes uncharged | Fixed: one `Pipeline::admit(Work)` path for items, chunks, remote map lookups, and inline maps (slot + reservation). Refused work that already holds bytes is skipped with a debug log; work that will fetch waits inside the fetcher while holding nothing (deadlock rule in `budget.rs` docs). Tests: `budget::tests` (grow/shrink/release, waiters, oversize) and `fetched_bodies_respect_the_memory_budget` (8 concurrent 600 KiB downloads + remote maps + inline maps under a 1 MiB budget: peak ≤ budget, `in_use() == 0` at the end, run 5× without flakes). New `CHALLENGES.md` #9 explains the RAII design |

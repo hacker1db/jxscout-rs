@@ -222,7 +222,35 @@ readable names and comments. Run the AST rules on them too.
 
 ---
 
-## 9. ★★★ JavaScript semantics in the chunk evaluator
+## 9. ★★ Explain (and stress) the RAII memory budget
+
+**Goal:** understand `src/budget.rs`, then prove one of its claims with
+a test of your own.
+
+Read it with these questions in mind:
+
+- Why is a `Reservation` taken *before* a body is read (`net/fetch.rs`,
+  `read_response`) instead of after?
+- What releases the bytes when a task errors out halfway, or when a
+  `tokio::select!` cancels it? (Hint: what does `Drop` do with an
+  `OwnedSemaphorePermit`?)
+- Why does `Reservation::try_grow` never wait, while `Budget::reserve`
+  does? Read the "deadlock rule" in the module docs, then explain the
+  scenario with two tasks and a FIFO-fair semaphore.
+- Why does `Pipeline::admit` *skip* an inline source map when the budget is
+  full, while a remote one just waits?
+
+**Then:** write a test where a task holding a reservation is cancelled
+(`JoinHandle::abort`) and assert `Budget::in_use()` returns to 0.
+
+**Done when** your test passes and you can answer the four questions in a
+paragraph each (put them in your PR description).
+
+**Prove it:** `cargo test budget::`
+
+---
+
+## 10. ★★★ JavaScript semantics in the chunk evaluator
 
 **Goal:** `Evaluator` in `src/js/chunks.rs` treats every value as a string.
 Real JS has numbers: `e + 1 + ".js"` is `"11.js"` for `e = 1` only if `e` is a

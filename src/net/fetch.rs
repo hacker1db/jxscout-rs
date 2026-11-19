@@ -18,6 +18,7 @@ use url::Url;
 
 use super::guard::{GuardedResolver, check_url_host};
 use super::ratelimit::RateLimiter;
+use crate::budget::{Budget, Reservation};
 use crate::config::{FetchConfig, ForwardAuth};
 use crate::model::{AuthContext, Headers};
 use crate::scope::{Decision, Scope};
@@ -66,7 +67,7 @@ impl<'a> FetchContext<'a> {
 }
 
 /// A completed response.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FetchResponse {
     /// Final URL after redirects.
     pub url: Url,
@@ -77,6 +78,9 @@ pub struct FetchResponse {
     /// Anything discovered from this response must not carry captured
     /// credentials, even if the chain ended back on the original origin.
     pub stayed_on_origin: bool,
+    /// The memory-budget reservation covering `body` (when the fetcher has
+    /// a [`Budget`]). Keep it alive as long as you keep the body.
+    pub memory: Option<Reservation>,
 }
 
 impl FetchResponse {
@@ -91,6 +95,8 @@ pub enum FetchError {
     Blocked(String),
     #[error("response larger than {limit} bytes")]
     TooLarge { limit: u64 },
+    #[error("memory budget exhausted while downloading")]
+    OverBudget,
     #[error("too many redirects")]
     TooManyRedirects,
     #[error("invalid redirect location `{0}`")]
@@ -123,6 +129,7 @@ struct Inner {
     download_referred: bool,
     limiter: RateLimiter,
     permits: Semaphore,
+    budget: Option<Budget>,
 }
 
 impl Fetcher {
@@ -148,11 +155,29 @@ impl Fetcher {
                 client,
                 limiter: RateLimiter::new(cfg.max_rps, cfg.max_rpm),
                 permits: Semaphore::new(cfg.concurrency.max(1)),
+                budget: None,
                 cfg,
                 scope,
                 download_referred,
             }),
         })
+    }
+
+    /// Charge every downloaded body to `budget`. The reservation is taken
+    /// once response headers arrive, *before* the body is read: the
+    /// announced length (or `max_body_bytes` when unknown), grown chunk by
+    /// chunk if the server lied, and shrunk to the real size at the end.
+    pub fn with_budget(
+        cfg: FetchConfig,
+        scope: Arc<Scope>,
+        download_referred: bool,
+        budget: Budget,
+    ) -> Result<Self, reqwest::Error> {
+        let mut f = Self::new(cfg, scope, download_referred)?;
+        Arc::get_mut(&mut f.inner)
+            .expect("fresh fetcher is unshared")
+            .budget = Some(budget);
+        Ok(f)
     }
 
     pub fn scope(&self) -> &Scope {
@@ -332,12 +357,30 @@ impl Fetcher {
                 })
                 .collect(),
         );
+        // Reserve memory before reading a single body byte. The task calling
+        // us holds no other reservation, so waiting here can't deadlock.
+        let mut memory = match &self.inner.budget {
+            Some(b) => {
+                let announced = resp.content_length().unwrap_or(limit).min(limit);
+                Some(b.reserve(announced as usize).await)
+            }
+            None => None,
+        };
         let mut body = Vec::new();
         while let Some(chunk) = resp.chunk().await? {
-            if body.len() as u64 + chunk.len() as u64 > limit {
+            let new_len = body.len() + chunk.len();
+            if new_len as u64 > limit {
                 return Err(FetchError::TooLarge { limit });
             }
+            if let Some(m) = memory.as_mut()
+                && !m.try_grow(new_len)
+            {
+                return Err(FetchError::OverBudget);
+            }
             body.extend_from_slice(&chunk);
+        }
+        if let Some(m) = memory.as_mut() {
+            m.shrink_to(body.len());
         }
         Ok(FetchResponse {
             url,
@@ -345,6 +388,7 @@ impl Fetcher {
             headers,
             body,
             stayed_on_origin: true,
+            memory,
         })
     }
 }

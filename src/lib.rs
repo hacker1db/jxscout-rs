@@ -9,6 +9,7 @@
 //!
 //! | module | responsibility |
 //! | --- | --- |
+//! | [`budget`] | the RAII memory budget every response body is charged to |
 //! | [`config`] | runtime configuration shared by every component |
 //! | [`scope`] | wildcard scope matching (R-20..R-24) |
 //! | [`model`] | captured request/response types and the ingest DTO (R-11) |
@@ -22,6 +23,7 @@
 //! | [`text`] | escaping untrusted text before it reaches a terminal |
 //! | [`tui`] | the ratatui terminal UI (R-90, R-91) |
 
+pub mod budget;
 pub mod config;
 pub mod events;
 pub mod ingest;

@@ -98,6 +98,9 @@ struct GlobalArgs {
     /// Numeric chunk ids tried when no chunk table is found.
     #[arg(long, default_value_t = 3000, global = true)]
     bruteforce_limit: u32,
+    /// Memory budget in MiB for response bodies held at once.
+    #[arg(long, default_value_t = 512, global = true)]
+    memory_budget_mb: usize,
     /// Max chunk-discovery recursion depth.
     #[arg(long, default_value_t = 3, global = true)]
     max_depth: u32,
@@ -258,6 +261,7 @@ fn build_config(g: &GlobalArgs) -> anyhow::Result<Config> {
             chunks: !g.no_chunks,
             sourcemaps: !g.no_sourcemaps,
             analyze: !g.no_analyze,
+            memory_budget: g.memory_budget_mb.max(1) * 1024 * 1024,
             ..DiscoveryConfig::default()
         },
     })
