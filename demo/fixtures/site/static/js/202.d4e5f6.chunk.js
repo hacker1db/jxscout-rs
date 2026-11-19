@@ -1,0 +1,1 @@
+(self.webpackChunk=self.webpackChunk||[]).push([[202],{202:function(e,t){t.del=function(id){return axios.delete("/api/v2/admin/users/"+id)};t.go=function(u){window.location.href=u};document.domain="acme.test"}}]);

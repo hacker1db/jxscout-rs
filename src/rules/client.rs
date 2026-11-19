@@ -372,10 +372,11 @@ impl Rule for NetworkRule {
                 let Some(path) = member_path(&call.callee) else {
                     return;
                 };
-                let url_arg = || {
-                    arg_expr(&call.arguments, 0)
-                        .and_then(string_value)
-                        .unwrap_or_else(|| cx.snippet(call.span))
+                // The URL argument: its string value, or its source text when
+                // it's built dynamically (`"/users/" + id`).
+                let url_arg = || match arg_expr(&call.arguments, 0) {
+                    Some(e) => string_value(e).unwrap_or_else(|| cx.snippet(e.span())),
+                    None => cx.snippet(call.span),
                 };
                 if matches!(
                     path.as_str(),
@@ -435,10 +436,15 @@ impl Rule for NetworkRule {
                 }
                 // axios.get("/x"), api.post("/users"), $.get("/y") …
                 if HTTP_METHODS.contains(&method.as_str()) {
-                    let first = arg_expr(&call.arguments, 0).and_then(string_value);
                     let is_known_client = path.starts_with("axios.")
                         || path.starts_with("$.")
                         || path.starts_with("jQuery.");
+                    let first = arg_expr(&call.arguments, 0).and_then(|e| match string_value(e) {
+                        Some(s) => Some(s),
+                        // Dynamic URL: only trust it for known clients.
+                        None if is_known_client => Some(cx.snippet(e.span())),
+                        None => None,
+                    });
                     if let Some(target) = first
                         && (is_known_client
                             || target.starts_with('/')
@@ -612,6 +618,16 @@ mod tests {
                new URLSearchParams(location.search); map.get(key);"#,
         );
         assert!(has(&f, "Client Behavior/fetch", "/api/v1/users"));
+        let dynamic = run(
+            NetworkRule,
+            r#"axios.delete("/api/users/" + id); fetch(base + "/x");"#,
+        );
+        assert!(has(
+            &dynamic,
+            "Client Behavior/Possible Rest Client/DELETE",
+            r#""/api/users/" + id"#
+        ));
+        assert!(has(&dynamic, "Client Behavior/fetch", r#"base + "/x""#));
         assert!(has(
             &f,
             "Object Schemas/Fetch Options",

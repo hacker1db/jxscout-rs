@@ -72,7 +72,12 @@ impl RuleContext<'_> {
     /// Record a finding at `span`.
     pub fn report(&mut self, span: Span, category: impl Into<String>, value: impl Into<String>) {
         let (line, column) = self.lines.line_col(span.start);
-        let mut value: String = value.into();
+        // Collapse whitespace runs so multi-line snippets stay one line.
+        let mut value: String = value
+            .into()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         if value.chars().count() > 300 {
             value = value.chars().take(300).collect::<String>() + "…";
         }

@@ -330,11 +330,17 @@ fn print_stats(p: &Pipeline, json: bool) -> anyhow::Result<()> {
 }
 
 async fn resolve_listen(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
-    let mut addrs = tokio::net::lookup_host((host, port))
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
-        .with_context(|| format!("resolving {host}"))?;
+        .with_context(|| format!("resolving {host}"))?
+        .collect();
+    // `localhost` often resolves to `::1` first; prefer IPv4 so clients
+    // posting to 127.0.0.1 (the Caido plugin default, curl examples) connect.
     addrs
-        .next()
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.first())
+        .copied()
         .with_context(|| format!("{host} resolved to no address"))
 }
 

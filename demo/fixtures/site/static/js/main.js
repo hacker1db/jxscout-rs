@@ -1,0 +1,2 @@
+(()=>{var r={};r.p="/";r.u=e=>"static/js/"+e+"."+{101:"a1b2c3",202:"d4e5f6"}[e]+".chunk.js";var cfg={region:"us-east-1",awsKey:"AKIAIOSFODNN7EXAMPLE"};window.addEventListener("message",function(e){document.getElementById("root").innerHTML=e.data.html});function load(id){return fetch("/api/v2/users/"+id,{method:"GET",headers:{"X-Requested-With":"XMLHttpRequest","X-Api-Version":"2"}})}if(location.hash){eval(decodeURIComponent(location.hash.slice(1)))}window.load=load})();
+//# sourceMappingURL=main.js.map
