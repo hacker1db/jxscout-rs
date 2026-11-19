@@ -1,0 +1,36 @@
+name: GitGuardian
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: ggshield secret scan
+    runs-on: ubuntu-latest
+    # Secrets can't be referenced in `if:` directly, so expose a boolean
+    # through the job env. Without GITGUARDIAN_API_KEY the scan step is
+    # skipped (not failed). Pull requests from forks never see the secret.
+    env:
+      HAS_GG_KEY: ${{ secrets.GITGUARDIAN_API_KEY != '' }}
+    steps:
+      - name: Skip notice
+        if: env.HAS_GG_KEY != 'true'
+        run: echo "::notice::GITGUARDIAN_API_KEY is not set; skipping the GitGuardian scan."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.HAS_GG_KEY == 'true'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: GitGuardian scan
+        if: env.HAS_GG_KEY == 'true'
+        uses: GitGuardian/ggshield-action@5cc1ed2be3e8bf625d354c7170731880670f74de # v1.56.1
+        env:
+          GITHUB_PUSH_BEFORE_SHA: ${{ github.event.before }}
+          GITHUB_PUSH_BASE_SHA: ${{ github.event.base }}
+          GITHUB_PULL_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GITGUARDIAN_API_KEY: ${{ secrets.GITGUARDIAN_API_KEY }}

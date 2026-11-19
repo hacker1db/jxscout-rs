@@ -1,0 +1,1 @@
+(self.webpackChunk=self.webpackChunk||[]).push([[101],{101:function(e,t,n){var q="query GetInvoices($first: Int) { invoices(first: $first) { id total customer { email } } }";localStorage.setItem("session_token",n.token);t.q=q}}]);

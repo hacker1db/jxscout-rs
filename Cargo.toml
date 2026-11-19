@@ -1,0 +1,67 @@
+[package]
+name = "jxscout-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Clean-room Rust reimplementation of jxscout: capture JS from your proxy, discover webpack/Vite chunks and source maps, and run AST analysis"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hacker1db/jxscout-rs"
+readme = "README.md"
+keywords = ["security", "javascript", "sourcemap", "webpack", "bugbounty"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["docs/demo.gif", "integrations/"]
+
+[lib]
+name = "jxscout"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jxscout-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.23"
+brotli-decompressor = "6"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+directories = "6"
+flate2 = "1"
+futures = "0.3"
+getrandom = "0.3"
+oxc_allocator = "0.159"
+oxc_ast = "0.159"
+oxc_ast_visit = "0.159"
+oxc_codegen = "0.159"
+oxc_parser = "0.159"
+oxc_span = "0.159"
+oxc_syntax = "0.159"
+percent-encoding = "2"
+ratatui = "0.30"
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "gzip", "brotli"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
+scraper = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+sourcemap = "9"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "io-std", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+
+[dev-dependencies]
+proptest = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
+tempfile = "3"
+wiremock = "0.6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

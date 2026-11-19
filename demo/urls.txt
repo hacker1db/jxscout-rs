@@ -1,0 +1,2 @@
+# Demo fixture (served by demo/serve-fixtures.sh)
+http://127.0.0.1:8765/
