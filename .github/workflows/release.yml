@@ -40,7 +40,7 @@ jobs:
       - if: matrix.zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.14.1
+          version: 0.17.1
       - if: matrix.zig
         uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
@@ -116,6 +116,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: integrations/caido/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
       - run: |

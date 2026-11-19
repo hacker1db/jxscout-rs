@@ -85,14 +85,25 @@ export const MAX_BODY_BYTES = 40 * 1024 * 1024;
  * Returns an error message, or `undefined` if the endpoint is acceptable.
  */
 export function endpointProblem(endpoint: string): string | undefined {
-  const m = /^(https?):\/\/(\[[^\]]+\]|[^/:?#]+)/i.exec(endpoint);
-  if (m === null) {
+  // Parse with the same WHATWG URL parser the HTTP client uses, so this
+  // check and the actual destination can't disagree (e.g. via userinfo:
+  // `http://127.0.0.1@evil.test/`).
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
     return `invalid endpoint URL: ${endpoint}`;
   }
-  const scheme = m[1]!.toLowerCase();
-  const host = m[2]!.toLowerCase();
-  const loopback = host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
-  if (scheme === "http" && !loopback) {
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return `invalid endpoint URL: ${endpoint}`;
+  }
+  if (url.username !== "" || url.password !== "") {
+    return `refusing endpoint with credentials in the URL: ${endpoint}`;
+  }
+  const host = url.hostname.toLowerCase();
+  const loopback =
+    host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
+  if (url.protocol === "http:" && !loopback) {
     return `refusing plain-http endpoint ${endpoint}: use https for non-loopback hosts`;
   }
   return undefined;

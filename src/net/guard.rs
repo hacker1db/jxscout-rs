@@ -59,6 +59,9 @@ fn is_forbidden_v6(ip: Ipv6Addr) -> bool {
         || (seg[0] & 0xffc0) == 0xfec0 // fec0::/10 site local (deprecated)
         || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
         || (seg[0] == 0x2001 && seg[1] == 0x0000)
+        // 64:ff9b:1::/48 local-use NAT64: the IPv4 position depends on the
+        // operator's prefix length, so block the whole range (RFC 8215)
+        || (seg[0] == 0x64 && seg[1] == 0xff9b && seg[2] == 1)
     // 2001::/32 Teredo: tunnels to an arbitrary IPv4 host; block outright
     {
         return true;
@@ -76,8 +79,6 @@ fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
         [0, 0, 0, 0, 0, 0, hi, lo] => Some(v4(hi, lo)),
         // 64:ff9b::/96 NAT64 well-known prefix
         [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] => Some(v4(hi, lo)),
-        // 64:ff9b:1::/48 local-use NAT64: IPv4 in the last 32 bits
-        [0x64, 0xff9b, 1, _, _, _, hi, lo] => Some(v4(hi, lo)),
         // 2002::/16 6to4: IPv4 in bits 16..48
         [0x2002, hi, lo, ..] => Some(v4(hi, lo)),
         _ => None,
@@ -157,7 +158,8 @@ mod tests {
             // embedded IPv4 transition forms
             "64:ff9b::7f00:1",     // NAT64 → 127.0.0.1
             "64:ff9b::a9fe:a9fe",  // NAT64 → 169.254.169.254
-            "64:ff9b:1::a00:1",    // local NAT64 → 10.0.0.1
+            "64:ff9b:1::a00:1",    // local NAT64 (whole /48 blocked)
+            "64:ff9b:1:101:101::", // local NAT64, /64 layout
             "2002:7f00:1::1",      // 6to4 → 127.0.0.1
             "2002:c0a8:101::1",    // 6to4 → 192.168.1.1
             "2001:0:4136:e378::1", // Teredo

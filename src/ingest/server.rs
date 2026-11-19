@@ -77,7 +77,12 @@ impl ServerConfig {
 struct AppState {
     pipeline: Pipeline,
     cfg: ServerConfig,
+    /// Bounds how many request bodies are buffered/decoded at once.
+    bodies: std::sync::Arc<tokio::sync::Semaphore>,
 }
+
+/// Concurrent ingest requests whose bodies may be in memory at once.
+pub const MAX_CONCURRENT_BODIES: usize = 8;
 
 /// Refuse non-loopback binds unless explicitly allowed (R-11a).
 pub fn check_bind_addr(addr: &SocketAddr, allow_remote: bool) -> Result<(), String> {
@@ -136,6 +141,11 @@ async fn guard(State(state): State<AppState>, req: Request<Body>, next: Next) ->
                 "Content-Type must be application/json",
             );
         }
+        // Held while the handler reads and decodes the body.
+        let Ok(_permit) = state.bodies.clone().acquire_owned().await else {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "shutting down");
+        };
+        return next.run(req).await;
     }
     next.run(req).await
 }
@@ -198,7 +208,11 @@ async fn ingest_batch(
 
 /// Build the router. Public so tests can drive it directly.
 pub fn router(pipeline: Pipeline, cfg: ServerConfig) -> Router {
-    let state = AppState { pipeline, cfg };
+    let state = AppState {
+        pipeline,
+        cfg,
+        bodies: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BODIES)),
+    };
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/ingest", post(ingest_one))

@@ -73,6 +73,10 @@ pub struct FetchResponse {
     pub status: u16,
     pub headers: Headers,
     pub body: Vec<u8>,
+    /// `false` if the redirect chain ever left the first request's origin.
+    /// Anything discovered from this response must not carry captured
+    /// credentials, even if the chain ended back on the original origin.
+    pub stayed_on_origin: bool,
 }
 
 impl FetchResponse {
@@ -297,7 +301,9 @@ impl Fetcher {
                     .map_err(|_| FetchError::BadRedirect(loc.to_string()))?;
                 continue;
             }
-            return self.read_response(current, resp).await;
+            let mut r = self.read_response(current, resp).await?;
+            r.stayed_on_origin = send_credentials;
+            return Ok(r);
         }
         Err(FetchError::TooManyRedirects)
     }
@@ -338,6 +344,7 @@ impl Fetcher {
             status,
             headers,
             body,
+            stayed_on_origin: true,
         })
     }
 }

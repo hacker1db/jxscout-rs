@@ -85,3 +85,17 @@ Scoped to `src/rules`, `src/tui`, `src/js/chunks.rs`.
 | 7 | Low | cargo-deny unsound scope | Fixed: `unsound = "all"` |
 | 8 | Low | Challenge 3 proof could pass vacuously; challenge 7 signature wording | Fixed both |
 | 9 | Low | README HAR command missing file | Fixed |
+
+## Milestone 5: final pre-PR pass (`7b90fa3..00c8e58`, plus `277a275..00c8e58 -- src/`)
+
+| # | Sev | Finding | Action |
+| --- | --- | --- | --- |
+| 1 | High | Credential eligibility lost when a redirect chain returned to the origin | Fixed: `FetchResponse::stayed_on_origin`; descendants of such a response get no captured credentials. `credentials_are_not_resent_after_leaving_the_origin` now also asserts the child request has no cookie (verified failing on the previous code). Static `--header` values stay scope-based by design (R-62) |
+| 2 | Med | Caido plaintext check used a regex on the authority (userinfo bypass) | Fixed: WHATWG `URL` parsing, userinfo rejected, userinfo tests. Redirect behavior of Caido's `fetch` isn't configurable through `RequestOpts`, so it's documented as a limitation |
+| 3 | Med | Non-2xx derived fetches stayed claimed for the session | Fixed: claim released on non-2xx too; test `failed_derived_fetch_can_be_rediscovered` |
+| 4 | Med | Admission bounded count, not bytes; `submit_wait` race | Fixed: RAII `AdmitGuard` over items **and** body bytes (512 MiB), `submit_wait` reserves atomically; ingest server bounds concurrent body buffering (8) |
+| 5 | Med | Chunk tables re-parsed per lookup | Fixed: tables parsed once per expression in `ExprInfo`, lookups by span |
+| 6 | Med | Local-use NAT64 IPv4 position assumed | Fixed: whole `64:ff9b:1::/48` blocked; tests |
+| 7 | Low | Temp file left on failed write; source writes on async worker | Fixed: temp removed on write failure; recovered-source batch runs in `spawn_blocking` |
+| 8 | Low | Raw filesystem paths printed | Rejected: the remaining raw paths (`analyze <file>`, project dir) are user-supplied CLI/config values, not attacker-derived; attacker-derived fields all go through `clean` |
+| 9 | Low | Release: Caido typecheck; gate publish on CI; TLS handshake in smoke | Fixed typecheck; zig pinned to 0.17.1 (the version the local aarch64-musl cross build was verified with). Rejected gating publish on a separate CI run: the release workflow rebuilds and smoke-tests every artifact itself and tags are cut from `main` after PR CI. Rejected a TLS handshake in smoke: needs network or a cert fixture; client construction + rustls init is covered |

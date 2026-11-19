@@ -228,7 +228,7 @@ impl Collector {
         let ids: Box<dyn Iterator<Item = String>> = if brute {
             Box::new((0..self.limits.bruteforce).map(|n| n.to_string()))
         } else {
-            Box::new(info.keys.into_iter())
+            Box::new(info.keys.clone().into_iter())
         };
         let budget = self.limits.max_urls + self.limits.bruteforce as usize;
         for id in ids {
@@ -236,7 +236,11 @@ impl Collector {
                 break;
             }
             self.evaluations += 1;
-            let ev = Evaluator { param, key: &id };
+            let ev = Evaluator {
+                param,
+                key: &id,
+                tables: &info.tables,
+            };
             if let Some(name) = ev.eval(expr)
                 && is_js_path(&name)
                 && self.names_seen.insert(name.clone())
@@ -356,6 +360,8 @@ struct ExprInfo {
     has_js_literal: bool,
     /// Union of the keys of every `{…}[param]` table.
     keys: BTreeSet<String>,
+    /// Each table, parsed once, keyed by its source offset.
+    tables: std::collections::HashMap<u32, BTreeMap<String, String>>,
 }
 
 impl ExprInfo {
@@ -407,7 +413,8 @@ impl ExprInfo {
                     if table.values().any(|v| v.contains(".js")) {
                         self.has_js_literal = true;
                     }
-                    self.keys.extend(table.into_keys());
+                    self.keys.extend(table.keys().cloned());
+                    self.tables.insert(obj.span.start, table);
                 } else {
                     self.scan(&m.object, param);
                 }
@@ -464,6 +471,9 @@ fn number_to_string(n: f64) -> String {
 struct Evaluator<'k> {
     param: &'k str,
     key: &'k str,
+    /// Tables pre-parsed by `ExprInfo::scan`, so each lookup is O(log n)
+    /// instead of re-reading the object literal for every chunk id.
+    tables: &'k std::collections::HashMap<u32, BTreeMap<String, String>>,
 }
 
 impl Evaluator<'_> {
@@ -494,9 +504,10 @@ impl Evaluator<'_> {
             },
             Expression::SequenceExpression(s) => self.eval(s.expressions.last()?),
             Expression::ComputedMemberExpression(m) => match m.object.without_parentheses() {
-                Expression::ObjectExpression(obj) if is_param(&m.expression, self.param) => {
-                    object_table(obj).remove(self.key)
-                }
+                Expression::ObjectExpression(obj) if is_param(&m.expression, self.param) => self
+                    .tables
+                    .get(&obj.span.start)
+                    .and_then(|t| t.get(self.key).cloned()),
                 _ => None,
             },
             // The public path is applied later in `resolve_webpack`.

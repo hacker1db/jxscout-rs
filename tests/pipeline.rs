@@ -448,7 +448,22 @@ async fn credentials_are_not_resent_after_leaving_the_origin() {
         .mount(&a)
         .await;
     Mock::given(path("/js/final.js"))
-        .respond_with(js("ok()"))
+        .respond_with(js(r#"import("/js/child.js");"#))
+        .with_priority(2)
+        .mount(&a)
+        .await;
+    // Codex M5 #1: descendants of a chain that left the origin and came
+    // back get no credentials either.
+    Mock::given(path("/js/child.js"))
+        .and(header_exists("cookie"))
+        .respond_with(ResponseTemplate::new(418))
+        .expect(0)
+        .with_priority(1)
+        .mount(&a)
+        .await;
+    Mock::given(path("/js/child.js"))
+        .respond_with(js("child()"))
+        .expect(1)
         .with_priority(2)
         .mount(&a)
         .await;
@@ -564,4 +579,48 @@ async fn redirect_target_is_not_a_trusted_parent() {
         .is_some()
     );
     // … but `/evil.js` on B was not (expect(0) verified on drop).
+}
+
+/// Codex M5 #3: a derived URL that failed (404/503/401) can be retried when
+/// another script references it later in the same session.
+#[tokio::test]
+async fn failed_derived_fetch_can_be_rediscovered() {
+    let server = MockServer::start().await;
+    Mock::given(path("/c.js"))
+        .respond_with(ResponseTemplate::new(404))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/c.js"))
+        .respond_with(js("c()"))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let p = pipeline(offline_config(tmp.path()));
+    let base = server.uri();
+    let script = r#"import("./c.js");"#;
+    run(
+        &p,
+        captured(
+            &format!("{base}/a.js"),
+            "application/javascript",
+            script,
+            &[],
+        ),
+    )
+    .await;
+    assert!(read(&p, &format!("{}/c.js", host_dir(&server))).is_none());
+    run(
+        &p,
+        captured(
+            &format!("{base}/b.js"),
+            "application/javascript",
+            script,
+            &[],
+        ),
+    )
+    .await;
+    assert!(read(&p, &format!("{}/c.js", host_dir(&server))).is_some());
 }

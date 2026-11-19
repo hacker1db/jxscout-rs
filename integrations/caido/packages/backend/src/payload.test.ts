@@ -11,6 +11,9 @@ test("plain http only to loopback", () => {
   assert.match(endpointProblem("http://10.0.0.5:3333/ingest") ?? "", /refusing/);
   assert.match(endpointProblem("http://127.0.0.1.evil.test/ingest") ?? "", /refusing/);
   assert.match(endpointProblem("ftp://x") ?? "", /invalid/);
+  // userinfo tricks: the real host is evil.test
+  assert.match(endpointProblem("http://127.0.0.1@evil.test/ingest") ?? "", /credentials|refusing/);
+  assert.match(endpointProblem("http://localhost:3333@10.0.0.1/ingest") ?? "", /credentials|refusing/);
 });
 
 test("base64 matches Node's encoder", () => {

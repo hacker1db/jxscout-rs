@@ -103,13 +103,21 @@ impl AssetStore {
         let tmp = target.with_file_name(tmp_name);
         // `create_new` (O_EXCL) fails instead of following a symlink that
         // someone planted at the temp path.
-        {
+        let written = (|| {
             use std::io::Write as _;
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&tmp)?;
-            f.write_all(bytes)?;
+            f.write_all(bytes)
+        })();
+        if let Err(e) = written {
+            // Don't leave half-written temp files behind (but never delete
+            // something we didn't create: `create_new` failed → not ours).
+            if e.kind() != io::ErrorKind::AlreadyExists {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            return Err(e);
         }
         if let Err(e) = std::fs::rename(&tmp, &target) {
             let _ = std::fs::remove_file(&tmp);

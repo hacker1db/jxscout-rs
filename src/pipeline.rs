@@ -82,6 +82,32 @@ fn bump(a: &AtomicUsize, n: usize) {
 
 /// Max queued + in-progress items before [`Pipeline::submit`] refuses.
 pub const MAX_PENDING: usize = 20_000;
+/// Max total body bytes held by queued + in-progress items.
+pub const MAX_PENDING_BYTES: usize = 512 * 1024 * 1024;
+
+/// Counters for bounded admission.
+#[derive(Debug, Default)]
+struct Admission {
+    items: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+/// Releases its share of the admission budget when dropped.
+struct AdmitGuard {
+    adm: Arc<Admission>,
+    bytes: usize,
+}
+
+impl Drop for AdmitGuard {
+    fn drop(&mut self) {
+        self.adm.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.adm.items.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn body_len(item: &Captured) -> usize {
+    item.response.as_ref().map_or(0, |r| r.body.len())
+}
 
 /// Cheap-to-clone handle to the pipeline.
 #[derive(Clone)]
@@ -100,7 +126,7 @@ struct Inner {
     seen: Mutex<HashSet<String>>,
     tracker: TaskTracker,
     /// Items submitted but not finished (bounded admission).
-    pending: Arc<AtomicUsize>,
+    admission: Arc<Admission>,
     /// Bounds CPU-heavy parse/analyze work.
     cpu: Semaphore,
     stats: Stats,
@@ -139,7 +165,7 @@ impl Pipeline {
                 events,
                 seen: Mutex::new(HashSet::new()),
                 tracker: TaskTracker::new(),
-                pending: Arc::new(AtomicUsize::new(0)),
+                admission: Arc::new(Admission::default()),
                 cpu: Semaphore::new(cpus),
                 stats: Stats::default(),
             }),
@@ -162,36 +188,71 @@ impl Pipeline {
         self.inner.stats.snapshot()
     }
 
-    /// Queue an item; returns immediately. Returns `false` (and drops the
-    /// item) when [`MAX_PENDING`] items are already queued, so a flood of
-    /// ingest requests or a huge chunk fan-out can't exhaust memory.
-    pub fn submit(&self, item: Captured) -> bool {
-        let pending = Arc::clone(&self.inner.pending);
-        if pending.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING {
-            pending.fetch_sub(1, Ordering::AcqRel);
-            tracing::warn!(url = %item.request.url, "pipeline overloaded, dropping item");
-            return false;
+    /// Reserve room for one item of `bytes` body size. The returned guard
+    /// gives the room back when dropped (RAII), including on panic or
+    /// cancellation.
+    fn try_admit(&self, bytes: usize) -> Option<AdmitGuard> {
+        let adm = &self.inner.admission;
+        if adm.items.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING {
+            adm.items.fetch_sub(1, Ordering::AcqRel);
+            return None;
         }
-        let this = self.clone();
-        self.inner.tracker.spawn(async move {
-            this.process(item).await;
-            pending.fetch_sub(1, Ordering::AcqRel);
-        });
-        true
+        if adm.bytes.fetch_add(bytes, Ordering::AcqRel) + bytes > MAX_PENDING_BYTES {
+            adm.bytes.fetch_sub(bytes, Ordering::AcqRel);
+            adm.items.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(AdmitGuard {
+            adm: Arc::clone(adm),
+            bytes,
+        })
     }
 
-    /// Like [`submit`](Self::submit) but waits for queue space instead of
+    fn spawn_admitted(&self, item: Captured, guard: AdmitGuard) {
+        let this = self.clone();
+        self.inner.tracker.spawn(async move {
+            let _guard = guard;
+            this.process(item).await;
+        });
+    }
+
+    /// Queue an item; returns immediately. Returns `false` (and drops the
+    /// item) when [`MAX_PENDING`] items or [`MAX_PENDING_BYTES`] of bodies
+    /// are already queued, so a flood of ingest requests or a huge chunk
+    /// fan-out can't exhaust memory.
+    pub fn submit(&self, item: Captured) -> bool {
+        match self.try_admit(body_len(&item)) {
+            Some(guard) => {
+                self.spawn_admitted(item, guard);
+                true
+            }
+            None => {
+                tracing::warn!(url = %item.request.url, "pipeline overloaded, dropping item");
+                false
+            }
+        }
+    }
+
+    /// Like [`submit`](Self::submit) but waits for room instead of
     /// dropping: backpressure for file-based sources.
     pub async fn submit_wait(&self, item: Captured) {
-        while self.inner.pending.load(Ordering::Acquire) >= MAX_PENDING {
+        let bytes = body_len(&item);
+        if bytes > MAX_PENDING_BYTES {
+            tracing::warn!(url = %item.request.url, "item body larger than the queue budget, dropping");
+            return;
+        }
+        loop {
+            if let Some(guard) = self.try_admit(bytes) {
+                self.spawn_admitted(item, guard);
+                return;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        self.submit(item);
     }
 
     /// Items queued or in progress.
     pub fn pending(&self) -> usize {
-        self.inner.pending.load(Ordering::Acquire)
+        self.inner.admission.items.load(Ordering::Acquire)
     }
 
     /// Wait until every submitted item and everything it spawned is done.
@@ -276,6 +337,7 @@ impl Pipeline {
 
         // `final_url` is where the bytes really came from (after redirects);
         // relative references resolve against it. `url` stays the DB key.
+        let mut auth = auth;
         let (response, final_url) = match item.response {
             Some(r) => (r, url.clone()),
             None => {
@@ -292,6 +354,11 @@ impl Pipeline {
                     .get(&url, &ctx)
                     .await
                     .with_context(|| format!("fetching {url}"))?;
+                // Credential eligibility doesn't come back after leaving the
+                // origin, even if the chain returned to it (R-61).
+                if !r.stayed_on_origin {
+                    auth = None;
+                }
                 (
                     CapturedResponse {
                         status: r.status,
@@ -305,6 +372,10 @@ impl Pipeline {
 
         if !(200..300).contains(&response.status) {
             tracing::debug!(%url, status = response.status, "skipping non-2xx response");
+            // Let a later discovery retry it (e.g. after a 503 or 401).
+            if !item.origin.is_captured() {
+                self.unmark_seen(&url);
+            }
             return Ok(());
         }
 
@@ -578,12 +649,12 @@ impl Pipeline {
             };
             match sourcemap::reverse(&bytes, inner.cfg.discovery.max_sourcemap_sources) {
                 Ok(rev) => {
-                    let written = self.write_sources(js_url, &rev);
-                    if !rev.missing_content.is_empty() {
+                    let missing = rev.missing_content.len();
+                    let written = self.write_sources(js_url.clone(), rev).await;
+                    if missing > 0 {
                         tracing::info!(
                             map = %map_url,
-                            "{} source(s) listed without sourcesContent",
-                            rev.missing_content.len()
+                            "{missing} source(s) listed without sourcesContent"
                         );
                     }
                     if let Err(e) = inner.db.record_sourcemap(&asset.db_url, &map_url, written) {
@@ -604,18 +675,27 @@ impl Pipeline {
         tracing::debug!(js = %js_url, "no source map found");
     }
 
-    fn write_sources(&self, js_url: &Url, rev: &sourcemap::Reversed) -> usize {
-        let mut written = 0;
-        for src in &rev.sources {
-            let Some(rel) = paths::sourcemap_source_path(js_url, &src.name) else {
-                continue;
-            };
-            match self.inner.store.write(&rel, src.content.as_bytes()) {
-                Ok(_) => written += 1,
-                Err(e) => tracing::warn!(source = %src.name, "could not write source: {e}"),
+    /// Write recovered sources on the blocking pool (it can be thousands
+    /// of small files).
+    async fn write_sources(&self, js_url: Url, rev: sourcemap::Reversed) -> usize {
+        let store = self.inner.store.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let mut written = 0;
+            for src in &rev.sources {
+                let Some(rel) = paths::sourcemap_source_path(&js_url, &src.name) else {
+                    continue;
+                };
+                match store.write(&rel, src.content.as_bytes()) {
+                    Ok(_) => written += 1,
+                    Err(e) => tracing::warn!(source = %src.name, "could not write source: {e}"),
+                }
             }
-        }
-        written
+            written
+        });
+        task.await.unwrap_or_else(|e| {
+            tracing::warn!("source write task failed: {e}");
+            0
+        })
     }
 }
 
