@@ -4,7 +4,7 @@ secret:
   # Unit/integration tests for the secrets AST rule contain obviously fake,
   # documented example values (e.g. AWS's AKIAIOSFODNN7EXAMPLE). They are
   # not credentials.
+  # Only the two files that embed AWS's documented example key.
   ignored_paths:
     - "src/rules/secrets.rs"
-    - "tests/**"
-    - "demo/fixtures/**"
+    - "demo/fixtures/site/static/js/main.js"

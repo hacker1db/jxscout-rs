@@ -86,7 +86,15 @@ category or value instead of filtering assets.
 - An integration test with `analysis_concurrency: Some(1)` still processes
   the fixture page from `tests/pipeline.rs`
 
-**Prove it:** `cargo test --test pipeline && cargo run -- --analysis-concurrency 0 rules; test $? -ne 0`
+**Prove it:**
+
+```sh
+cargo build && cargo test --test pipeline \
+  && cargo run -q -- --analysis-concurrency 2 rules >/dev/null \
+  && cargo run -q -- --analysis-concurrency 0 rules 2>&1 | grep -q "analysis-concurrency"
+```
+
+(The last step passes only if clap rejects `0` with a message naming the flag.)
 
 ---
 
@@ -163,7 +171,8 @@ subcommand in `src/main.rs`.
 
 ## 7. ★★★ A dyn-compatible ingest trait
 
-**Goal:** `IngestSource` uses `async fn` in a trait, so you can't write
+**Goal:** `IngestSource::run` returns `impl Future<Output = …> + Send`
+(implementations write it as `async fn`), so you can't write
 `Vec<Box<dyn IngestSource>>`. Make sources selectable at runtime, for example
 to run the HTTP server **and** a URL list in one process.
 

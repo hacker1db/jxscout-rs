@@ -76,6 +76,28 @@ export type Settings = {
 
 export const DEFAULT_ENDPOINT = "http://127.0.0.1:3333/ingest";
 
+/** Bodies above this are skipped: base64 + JSON must fit the 64 MiB server cap. */
+export const MAX_BODY_BYTES = 40 * 1024 * 1024;
+
+/**
+ * Captured cookies and the bearer token must not cross the network in
+ * clear text: plain `http` is only allowed to loopback hosts.
+ * Returns an error message, or `undefined` if the endpoint is acceptable.
+ */
+export function endpointProblem(endpoint: string): string | undefined {
+  const m = /^(https?):\/\/(\[[^\]]+\]|[^/:?#]+)/i.exec(endpoint);
+  if (m === null) {
+    return `invalid endpoint URL: ${endpoint}`;
+  }
+  const scheme = m[1]!.toLowerCase();
+  const host = m[2]!.toLowerCase();
+  const loopback = host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
+  if (scheme === "http" && !loopback) {
+    return `refusing plain-http endpoint ${endpoint}: use https for non-loopback hosts`;
+  }
+  return undefined;
+}
+
 export function parseSettings(get: (name: string) => string | undefined): Settings {
   const endpoint = get("JXSCOUT_ENDPOINT")?.trim() || DEFAULT_ENDPOINT;
   const token = get("JXSCOUT_TOKEN")?.trim() || undefined;

@@ -12,7 +12,7 @@ import type { SDK } from "caido:plugin";
 import type { Request, Response } from "caido:utils";
 import { Blob, Request as FetchRequest, fetch } from "caido:http";
 
-import { buildPayload, parseSettings, shouldForward } from "./payload.ts";
+import { MAX_BODY_BYTES, buildPayload, endpointProblem, parseSettings, shouldForward } from "./payload.ts";
 
 async function forward(sdk: SDK, request: Request, response: Response): Promise<void> {
   const settings = parseSettings((name) => sdk.env.getVar(name));
@@ -23,7 +23,18 @@ async function forward(sdk: SDK, request: Request, response: Response): Promise<
   if (!shouldForward(request.getPath(), responseHeaders)) {
     return;
   }
-  const body = response.getBody()?.toRaw() ?? new Uint8Array();
+  const problem = endpointProblem(settings.endpoint);
+  if (problem !== undefined) {
+    sdk.console.error(`jxscout-rs: ${problem}`);
+    return;
+  }
+  const rawBody = response.getBody();
+  // Check the size before copying/encoding anything.
+  if (rawBody !== undefined && rawBody.length > MAX_BODY_BYTES) {
+    sdk.console.warn(`jxscout-rs: skipping ${request.getUrl()} (${rawBody.length} bytes > ${MAX_BODY_BYTES})`);
+    return;
+  }
+  const body = rawBody?.toRaw() ?? new Uint8Array();
   const payload = buildPayload(
     request.getUrl(),
     request.getMethod(),

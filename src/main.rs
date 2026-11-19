@@ -357,6 +357,7 @@ async fn serve(cfg: Config, args: ServeArgs, debug: bool) -> anyhow::Result<()> 
 
     let pipeline = Pipeline::new(cfg, bus)?;
     let shutdown = CancellationToken::new();
+    let args_token_generated = !args.no_auth && args.ingest_token.is_none();
     let token = if args.no_auth {
         tracing::warn!("ingest authentication disabled (--no-auth)");
         None
@@ -404,8 +405,17 @@ async fn serve(cfg: Config, args: ServeArgs, debug: bool) -> anyhow::Result<()> 
             log = %log_path.display(),
             "jxscout-rs ready on http://{local}/ingest (Ctrl-C to stop)"
         );
-        if let Some(t) = &token {
-            eprintln!("ingest token: {t}  (send `Authorization: Bearer {t}`)");
+        // Never print the token itself; logs get pasted into issues.
+        if args_token_generated {
+            eprintln!(
+                "ingest token stored in {} (send it as `Authorization: Bearer <token>`)",
+                pipeline
+                    .config()
+                    .output_dir
+                    .join(".jxscout-rs")
+                    .join("ingest-token")
+                    .display()
+            );
         }
         shutdown.cancelled().await;
     }

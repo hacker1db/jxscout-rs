@@ -6,6 +6,7 @@ all-features = false
 # Fail on any RustSec advisory (vulnerability, unmaintained, unsound, yanked).
 version = 2
 yanked = "deny"
+unsound = "all"
 ignore = []
 
 [licenses]

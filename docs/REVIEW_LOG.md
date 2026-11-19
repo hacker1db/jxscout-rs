@@ -71,3 +71,17 @@ Scoped to `src/rules`, `src/tui`, `src/js/chunks.rs`.
 | --- | --- | --- | --- |
 | 1 | Med | Post-redirect base used as trusted parent: credential leak / scope bypass | Fixed: children and source-map fetches use the requested URL as parent; credentials dropped when the final origin differs; cross-origin `in-scope` forwarding mode removed entirely (R-61). Regression `redirect_target_is_not_a_trusted_parent` (verified failing on the old code) |
 | 2 | Med | `analyze` printed category unsanitized | Fixed: categories restricted to a safe alphabet at creation (`text::category`), verbs allow-listed, `Clean` Display wrapper added, all CLI prints sanitized; `tests/output_hygiene.rs` fails on any raw finding-field `println!` |
+
+## Milestone 4: CI, CodeQL, GitGuardian, release, Caido plugin, docs (`277a275..7b90fa3`)
+
+| # | Sev | Finding | Action |
+| --- | --- | --- | --- |
+| 1 | Med | Manual dispatch against a tag could publish | Fixed: publish requires `push` + tag; `gh release create --verify-tag` |
+| 2 | Med | Caido plugin could send cookies/token over plaintext to a remote endpoint | Fixed: plain `http` only to loopback (`endpointProblem` + test); README says mark `JXSCOUT_TOKEN` secret |
+| 3 | Med | Headless mode printed the token | Fixed: prints only the token file path for generated tokens, nothing for explicit ones |
+| 4 | Med | Caido plugin encoded bodies the server would reject | Fixed: 40 MiB pre-check on `Body.length` before copying |
+| 5 | Low | arm64 musl never executed; smoke test too shallow; zigbuild unpinned | Fixed: `smoke-arm64` job on `ubuntu-24.04-arm`, shared `.github/smoke-test.sh` (static check, SQLite, TLS client, analyzer), `cargo-zigbuild@0.24.1` |
+| 6 | Low | GitGuardian ignores too broad | Fixed: only the two files embedding AWS's documented example key. Kept the skip-with-notice behavior when the secret is absent (explicit requirement) |
+| 7 | Low | cargo-deny unsound scope | Fixed: `unsound = "all"` |
+| 8 | Low | Challenge 3 proof could pass vacuously; challenge 7 signature wording | Fixed both |
+| 9 | Low | README HAR command missing file | Fixed |

@@ -1,7 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { base64, buildPayload, parseSettings, shouldForward, DEFAULT_ENDPOINT } from "./payload.ts";
+import { base64, buildPayload, endpointProblem, parseSettings, shouldForward, DEFAULT_ENDPOINT } from "./payload.ts";
+
+test("plain http only to loopback", () => {
+  assert.equal(endpointProblem("http://127.0.0.1:3333/ingest"), undefined);
+  assert.equal(endpointProblem("http://localhost:3333/ingest"), undefined);
+  assert.equal(endpointProblem("http://[::1]:3333/ingest"), undefined);
+  assert.equal(endpointProblem("https://jx.internal.example/ingest"), undefined);
+  assert.match(endpointProblem("http://10.0.0.5:3333/ingest") ?? "", /refusing/);
+  assert.match(endpointProblem("http://127.0.0.1.evil.test/ingest") ?? "", /refusing/);
+  assert.match(endpointProblem("ftp://x") ?? "", /invalid/);
+});
 
 test("base64 matches Node's encoder", () => {
   for (const s of ["", "a", "ab", "abc", "abcd", "hello world", "ÿ\u0000\u0010"]) {

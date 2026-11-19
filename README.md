@@ -98,8 +98,9 @@ jxscout-rs -p acme -s '*.acme.com,!static.acme.com'
 ```
 
 This starts the TUI and an ingest endpoint on `http://127.0.0.1:3333/ingest`.
-The header shows the **ingest token** (also stored in
-`~/jxscout/.jxscout-rs/ingest-token`). Then send it traffic with one of the
+The TUI header shows the **ingest token**. It is generated once and stored in
+`~/jxscout/.jxscout-rs/ingest-token` (mode 0600); headless mode prints only
+that path, never the token. Then send it traffic with one of the
 options below. Assets land in `~/jxscout/acme/`; open that folder in your editor.
 
 ### Caido
@@ -108,10 +109,15 @@ options below. Assets land in `~/jxscout/acme/`; open that folder in your editor
    `cd integrations/caido && pnpm install && pnpm build`).
 2. Caido → **Plugins** → **Install package** → pick the zip.
 3. Caido → **Environment** → **Global**, add:
-   - `JXSCOUT_TOKEN` = the token from the jxscout-rs header
+   - `JXSCOUT_TOKEN` = the token from the jxscout-rs header (mark it as a
+     **secret** variable)
    - optional `JXSCOUT_ENDPOINT` (default `http://127.0.0.1:3333/ingest`)
    - optional `JXSCOUT_IN_SCOPE_ONLY` = `false` to forward everything
      (default: only requests in your Caido scope)
+
+   The plugin refuses plain-`http` endpoints that aren't loopback, so captured
+   cookies and the token never cross the network unencrypted. Responses
+   larger than 40 MiB are skipped.
 
 Browse the target with your browser cache disabled; every HTML/JS response
 flows into jxscout-rs.
@@ -123,7 +129,8 @@ There's no Burp extension yet. Options that work today:
 - Chain Burp → Caido (Caido as upstream proxy) and use the Caido plugin.
 - Site map → select items → **Copy URLs**, then
   `pbpaste | jxscout-rs -p acme ingest-urls -`.
-- Export a HAR from the browser devtools and run `jxscout-rs ingest-har`.
+- Export a HAR from the browser devtools and run
+  `jxscout-rs -p acme ingest-har session.har`.
 
 ### curl, scripts, and other tools
 
