@@ -99,3 +99,9 @@ Scoped to `src/rules`, `src/tui`, `src/js/chunks.rs`.
 | 7 | Low | Temp file left on failed write; source writes on async worker | Fixed: temp removed on write failure; recovered-source batch runs in `spawn_blocking` |
 | 8 | Low | Raw filesystem paths printed | Rejected: the remaining raw paths (`analyze <file>`, project dir) are user-supplied CLI/config values, not attacker-derived; attacker-derived fields all go through `clean` |
 | 9 | Low | Release: Caido typecheck; gate publish on CI; TLS handshake in smoke | Fixed typecheck; zig pinned to 0.17.1 (the version the local aarch64-musl cross build was verified with). Rejected gating publish on a separate CI run: the release workflow rebuilds and smoke-tests every artifact itself and tags are cut from `main` after PR CI. Rejected a TLS handshake in smoke: needs network or a cert fixture; client construction + rustls init is covered |
+
+## Security review, 3rd pass (security-guidance plugin, on `17fa8b1`)
+
+| # | Sev | Finding | Action |
+| --- | --- | --- | --- |
+| 1 | Med | Memory budget only charged captured bodies; URL-only items, chunks, and source maps were fetched at "0 bytes" | Fixed: the budget is now a KiB-unit semaphore (`DiscoveryConfig::memory_budget`, default 512 MiB). Captured bodies are charged at admission (fallible, so HTTP gets 503); every tool-fetched body (pages, scripts, chunks, maps) is charged right after download and held until its processing ends; children go through the same path. Downloads already stream with a hard `max_body_bytes` cutoff, and in-flight downloads are bounded by `--fetch-concurrency`. Source-map lookups run as their own task, so no budget holder ever waits for more budget (no deadlock under the FIFO-fair semaphore). Test `fetched_bodies_respect_the_memory_budget`: 8 × 600 KiB scripts plus 300 KiB maps under a 1 MiB budget, all saved, peak ≤ budget |

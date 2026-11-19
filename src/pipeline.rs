@@ -82,25 +82,53 @@ fn bump(a: &AtomicUsize, n: usize) {
 
 /// Max queued + in-progress items before [`Pipeline::submit`] refuses.
 pub const MAX_PENDING: usize = 20_000;
-/// Max total body bytes held by queued + in-progress items.
-pub const MAX_PENDING_BYTES: usize = 512 * 1024 * 1024;
+/// Default memory budget for response bodies held by the pipeline
+/// (captured bodies, fetched pages/scripts/chunks, and source maps).
+pub const DEFAULT_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
 
-/// Counters for bounded admission.
-#[derive(Debug, Default)]
-struct Admission {
-    items: AtomicUsize,
-    bytes: AtomicUsize,
+/// The byte budget is a semaphore with one permit per KiB, so holders can
+/// `await` room (backpressure) and release it automatically on drop.
+const BUDGET_UNIT: usize = 1024;
+
+fn units(bytes: usize) -> u32 {
+    bytes.div_ceil(BUDGET_UNIT).max(1).min(u32::MAX as usize) as u32
 }
 
-/// Releases its share of the admission budget when dropped.
+/// Item count + memory budget.
+#[derive(Debug)]
+struct Admission {
+    items: AtomicUsize,
+    memory: Arc<Semaphore>,
+    total_units: u32,
+    /// Highest number of KiB units ever held at once (for tests/stats).
+    peak_units: AtomicUsize,
+}
+
+impl Admission {
+    fn new(budget_bytes: usize) -> Self {
+        let total_units = units(budget_bytes).min(Semaphore::MAX_PERMITS as u32);
+        Self {
+            items: AtomicUsize::new(0),
+            memory: Arc::new(Semaphore::new(total_units as usize)),
+            total_units,
+            peak_units: AtomicUsize::new(0),
+        }
+    }
+
+    fn record_peak(&self) {
+        let used = self.total_units as usize - self.memory.available_permits();
+        self.peak_units.fetch_max(used, Ordering::AcqRel);
+    }
+}
+
+/// Releases one item slot (and, if held, the captured body's bytes) on drop.
 struct AdmitGuard {
     adm: Arc<Admission>,
-    bytes: usize,
+    _memory: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl Drop for AdmitGuard {
     fn drop(&mut self) {
-        self.adm.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
         self.adm.items.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -155,6 +183,7 @@ impl Pipeline {
             cfg.download_referred_js,
         )?;
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let memory_budget = cfg.discovery.memory_budget;
         Ok(Self {
             inner: Arc::new(Inner {
                 cfg,
@@ -165,7 +194,7 @@ impl Pipeline {
                 events,
                 seen: Mutex::new(HashSet::new()),
                 tracker: TaskTracker::new(),
-                admission: Arc::new(Admission::default()),
+                admission: Arc::new(Admission::new(memory_budget)),
                 cpu: Semaphore::new(cpus),
                 stats: Stats::default(),
             }),
@@ -197,15 +226,47 @@ impl Pipeline {
             adm.items.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
-        if adm.bytes.fetch_add(bytes, Ordering::AcqRel) + bytes > MAX_PENDING_BYTES {
-            adm.bytes.fetch_sub(bytes, Ordering::AcqRel);
-            adm.items.fetch_sub(1, Ordering::AcqRel);
-            return None;
-        }
+        // Captured bodies are already in memory: charge them now (fallible).
+        let memory = if bytes > 0 {
+            match adm.memory.clone().try_acquire_many_owned(units(bytes)) {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    adm.items.fetch_sub(1, Ordering::AcqRel);
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        adm.record_peak();
         Some(AdmitGuard {
             adm: Arc::clone(adm),
-            bytes,
+            _memory: memory,
         })
+    }
+
+    /// Reserve memory for `bytes` of fetched data, waiting for room. Bodies
+    /// fetched by the tool (URL-only items, chunks, source maps) are charged
+    /// here, right after download and before any further processing, so
+    /// the number of bodies held at once is bounded by the budget. The
+    /// fetch itself is capped by `max_body_bytes` while streaming.
+    async fn reserve_memory(&self, bytes: usize) -> tokio::sync::OwnedSemaphorePermit {
+        let adm = &self.inner.admission;
+        let wanted = units(bytes).min(adm.total_units);
+        let permit = adm
+            .memory
+            .clone()
+            .acquire_many_owned(wanted)
+            .await
+            .expect("memory semaphore is never closed");
+        adm.record_peak();
+        permit
+    }
+
+    /// Highest number of body bytes held at once so far (approximate, KiB
+    /// granularity).
+    pub fn peak_memory_bytes(&self) -> usize {
+        self.inner.admission.peak_units.load(Ordering::Acquire) * BUDGET_UNIT
     }
 
     fn spawn_admitted(&self, item: Captured, guard: AdmitGuard) {
@@ -217,8 +278,8 @@ impl Pipeline {
     }
 
     /// Queue an item; returns immediately. Returns `false` (and drops the
-    /// item) when [`MAX_PENDING`] items or [`MAX_PENDING_BYTES`] of bodies
-    /// are already queued, so a flood of ingest requests or a huge chunk
+    /// item) when [`MAX_PENDING`] items are queued or a captured body
+    /// doesn't fit the memory budget, so a flood of ingest requests or a huge chunk
     /// fan-out can't exhaust memory.
     pub fn submit(&self, item: Captured) -> bool {
         match self.try_admit(body_len(&item)) {
@@ -237,7 +298,7 @@ impl Pipeline {
     /// dropping: backpressure for file-based sources.
     pub async fn submit_wait(&self, item: Captured) {
         let bytes = body_len(&item);
-        if bytes > MAX_PENDING_BYTES {
+        if units(bytes) > self.inner.admission.total_units {
             tracing::warn!(url = %item.request.url, "item body larger than the queue budget, dropping");
             return;
         }
@@ -338,6 +399,8 @@ impl Pipeline {
         // `final_url` is where the bytes really came from (after redirects);
         // relative references resolve against it. `url` stays the DB key.
         let mut auth = auth;
+        // Held until this item is fully processed.
+        let mut _fetched_memory = None;
         let (response, final_url) = match item.response {
             Some(r) => (r, url.clone()),
             None => {
@@ -354,6 +417,7 @@ impl Pipeline {
                     .get(&url, &ctx)
                     .await
                     .with_context(|| format!("fetching {url}"))?;
+                _fetched_memory = Some(self.reserve_memory(r.body.len()).await);
                 // Credential eligibility doesn't come back after leaving the
                 // origin, even if the chain returned to it (R-61).
                 if !r.stayed_on_origin {
@@ -576,7 +640,24 @@ impl Pipeline {
         }
 
         if inner.cfg.discovery.sourcemaps && asset.find_sourcemaps {
-            self.find_sourcemap(cx, &asset).await;
+            // Runs as its own task so the map download doesn't wait for
+            // memory while this item still holds its script's share (the
+            // budget semaphore is FIFO-fair, so that could deadlock).
+            let job = MapJob {
+                candidates: sourcemap::candidates(&asset.base, &asset.headers, &asset.text),
+                js_url: asset.base.clone(),
+                db_url: asset.db_url.clone(),
+                parent: cx.url.clone(),
+                // Same rule as for chunks: credentials don't follow a
+                // cross-origin redirect.
+                auth: (cx.base.origin() == cx.url.origin())
+                    .then(|| cx.auth.cloned())
+                    .flatten(),
+            };
+            let this = self.clone();
+            self.inner
+                .tracker
+                .spawn(async move { this.find_sourcemap(job).await });
         }
         Ok(())
     }
@@ -618,24 +699,26 @@ impl Pipeline {
     }
 
     /// Try every source-map candidate; the first that validates wins (R-71).
-    async fn find_sourcemap(&self, cx: &ItemCtx<'_>, asset: &JsAsset) {
+    async fn find_sourcemap(&self, job: MapJob) {
         let inner = &self.inner;
-        let js_url = &asset.base;
-        for candidate in sourcemap::candidates(js_url, &asset.headers, &asset.text) {
-            let (map_url, bytes) = match candidate {
-                sourcemap::Candidate::Inline { bytes } => (format!("{js_url}#inline-map"), bytes),
+        let js_url = &job.js_url;
+        for candidate in job.candidates {
+            let (map_url, bytes, _map_memory) = match candidate {
+                sourcemap::Candidate::Inline { bytes } => {
+                    (format!("{js_url}#inline-map"), bytes, None)
+                }
                 sourcemap::Candidate::Remote { url, why } => {
-                    // Same rule as for chunks: the trusted parent is the
-                    // requested URL, and credentials don't follow a
-                    // cross-origin redirect.
-                    let auth = (cx.base.origin() == cx.url.origin())
-                        .then_some(cx.auth)
-                        .flatten();
+                    // The trusted parent is the requested URL.
                     let ctx = FetchContext::new(Purpose::SourceMap)
-                        .with_parent(Some(cx.url))
-                        .with_auth(auth);
+                        .with_parent(Some(&job.parent))
+                        .with_auth(job.auth.as_ref());
                     match inner.fetcher.get(&url, &ctx).await {
-                        Ok(r) if r.is_success() => (url.to_string(), r.body),
+                        Ok(r) if r.is_success() => {
+                            // Charge the map against the memory budget while
+                            // it's parsed and written.
+                            let permit = self.reserve_memory(r.body.len()).await;
+                            (url.to_string(), r.body, Some(permit))
+                        }
                         Ok(r) => {
                             tracing::debug!(%url, status = r.status, why, "source map candidate rejected");
                             continue;
@@ -657,13 +740,13 @@ impl Pipeline {
                             "{missing} source(s) listed without sourcesContent"
                         );
                     }
-                    if let Err(e) = inner.db.record_sourcemap(&asset.db_url, &map_url, written) {
+                    if let Err(e) = inner.db.record_sourcemap(&job.db_url, &map_url, written) {
                         tracing::warn!("recording source map: {e}");
                     }
                     bump(&inner.stats.sourcemaps, 1);
                     tracing::info!(js = %js_url, map = %map_url, "reversed {written} source file(s)");
                     inner.events.emit(Event::SourceMapReversed {
-                        js_url: asset.db_url.clone(),
+                        js_url: job.db_url.clone(),
                         map_url,
                         sources: written,
                     });
@@ -697,6 +780,18 @@ impl Pipeline {
             0
         })
     }
+}
+
+/// A source-map lookup, run as its own task (see `handle_js`).
+struct MapJob {
+    candidates: Vec<sourcemap::Candidate>,
+    /// URL the map references resolve against (final URL of the script).
+    js_url: Url,
+    /// Database key of the script.
+    db_url: String,
+    /// Trusted parent for scope decisions: the requested script URL.
+    parent: Url,
+    auth: Option<AuthContext>,
 }
 
 /// Per-item context passed down the handlers.

@@ -98,6 +98,9 @@ pub struct DiscoveryConfig {
     pub chunks: bool,
     pub sourcemaps: bool,
     pub analyze: bool,
+    /// Max bytes of response bodies held in memory at once across all
+    /// in-flight items (R-36). Items wait for room.
+    pub memory_budget: usize,
 }
 
 impl Default for DiscoveryConfig {
@@ -110,6 +113,7 @@ impl Default for DiscoveryConfig {
             chunks: true,
             sourcemaps: true,
             analyze: true,
+            memory_budget: crate::pipeline::DEFAULT_MEMORY_BUDGET,
         }
     }
 }

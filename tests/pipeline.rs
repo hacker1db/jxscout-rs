@@ -624,3 +624,45 @@ async fn failed_derived_fetch_can_be_rediscovered() {
     .await;
     assert!(read(&p, &format!("{}/c.js", host_dir(&server))).is_some());
 }
+
+/// Security review (3rd pass): URL-only items, chunks, and source maps are
+/// fetched by the tool, so their bodies must count against the memory
+/// budget too. Many large fetched bodies never exceed it, and none are lost.
+#[tokio::test]
+async fn fetched_bodies_respect_the_memory_budget() {
+    let server = MockServer::start().await;
+    // 600 KiB scripts with a 300 KiB source map each.
+    let big = format!("var x = \"{}\";", "a".repeat(600 * 1024));
+    Mock::given(wiremock::matchers::path_regex(r"^/s\d+\.js$"))
+        .respond_with(js(&big))
+        .mount(&server)
+        .await;
+    let map = format!(
+        r#"{{"version":3,"sources":["a.js"],"sourcesContent":["{}"],"names":[],"mappings":""}}"#,
+        "b".repeat(300 * 1024)
+    );
+    Mock::given(wiremock::matchers::path_regex(r"^/s\d+\.js\.map$"))
+        .respond_with(json(&map))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = config(tmp.path());
+    let budget = 1024 * 1024; // room for one script + one map, not two scripts
+    cfg.discovery.memory_budget = budget;
+    let p = pipeline(cfg);
+    for i in 0..8 {
+        let url = Url::parse(&format!("{}/s{i}.js", server.uri())).unwrap();
+        assert!(p.submit(Captured::url_only(url, Origin::UrlList)));
+    }
+    p.wait_idle().await;
+
+    let s = p.stats();
+    assert_eq!((s.saved, s.sourcemaps, s.errors), (8, 8, 0), "{s:?}");
+    assert!(
+        p.peak_memory_bytes() <= budget,
+        "peak {} > budget {budget}",
+        p.peak_memory_bytes()
+    );
+    assert!(p.peak_memory_bytes() > 0);
+}
